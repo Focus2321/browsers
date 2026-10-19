@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{fs, u32};
 
 use image::imageops::FilterType;
@@ -59,10 +59,23 @@ pub struct Config {
     behavior: BehavioralConfig,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct BehavioralConfig {
     pub unwrap_urls: bool,
+
+    // macOS only: after a link is opened (or the popup dismissed) hide the popup and keep running,
+    // so the next link shows it instantly instead of cold-launching the app again
+    pub run_in_background: bool,
+}
+
+impl Default for BehavioralConfig {
+    fn default() -> Self {
+        BehavioralConfig {
+            unwrap_urls: false,
+            run_in_background: true,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -322,31 +335,89 @@ impl OSAppFinder {
         }
     }
 
+    fn installed_browsers_cache_path() -> PathBuf {
+        let cache_root_dir = paths::get_cache_root_dir();
+        fs::create_dir_all(cache_root_dir.as_path()).unwrap();
+        cache_root_dir.join("installed_browsers.json")
+    }
+
+    // returns the installed apps, and whether they came from the cache (and so might be slightly
+    // out of date, see rescan_installed_browsers)
     pub(crate) fn get_installed_browsers_cached(
         &self,
         force_reload: bool,
-    ) -> Vec<InstalledBrowser> {
-        let cache_root_dir = paths::get_cache_root_dir();
-        fs::create_dir_all(cache_root_dir.as_path()).unwrap();
+    ) -> (Vec<InstalledBrowser>, bool) {
+        let installed_browsers_json_path = Self::installed_browsers_cache_path();
 
-        let installed_browsers_json_path = cache_root_dir.join("installed_browsers.json");
+        if !force_reload && !is_installed_browsers_cache_stale(&installed_browsers_json_path) {
+            let cached: Option<Vec<InstalledBrowser>> =
+                File::open(installed_browsers_json_path.as_path())
+                    .ok()
+                    .and_then(|file| serde_json::from_reader(BufReader::new(file)).ok());
+            if let Some(installed_browsers_cached) = cached {
+                return (installed_browsers_cached, true);
+            }
+        }
 
-        if !force_reload && installed_browsers_json_path.exists() {
-            // Open the file in read-only mode with buffer.
-            let file = File::open(installed_browsers_json_path).unwrap();
-            let reader = BufReader::new(file);
+        let installed_browsers = self.get_installed_browsers();
+        Self::save_installed_browsers_cache(&installed_browsers);
+        (installed_browsers, false)
+    }
 
-            let a: Result<Vec<InstalledBrowser>, _> = serde_json::from_reader(reader);
-            let installed_browsers_cached = a.unwrap_or_default();
-            return installed_browsers_cached;
-        } else {
-            let installed_browsers = self.get_installed_browsers();
+    // full rescan, which also refreshes the cache (even if nothing changed, so it stops being
+    // considered stale against the apps folders)
+    pub(crate) fn rescan_installed_browsers(&self) -> Vec<InstalledBrowser> {
+        let installed_browsers = self.get_installed_browsers();
+        Self::save_installed_browsers_cache(&installed_browsers);
+        installed_browsers
+    }
 
-            let buffer = File::create(installed_browsers_json_path).unwrap();
-            serde_json::to_writer_pretty(buffer, &installed_browsers).unwrap();
-            return installed_browsers;
+    fn save_installed_browsers_cache(installed_browsers: &[InstalledBrowser]) {
+        let installed_browsers_json_path = Self::installed_browsers_cache_path();
+        let result = File::create(installed_browsers_json_path.as_path())
+            .map_err(|err| err.to_string())
+            .and_then(|buffer| {
+                serde_json::to_writer_pretty(buffer, installed_browsers)
+                    .map_err(|err| err.to_string())
+            });
+        if let Err(err) = result {
+            warn!(
+                "Could not write {}: {}",
+                installed_browsers_json_path.display(),
+                err
+            );
         }
     }
+}
+
+// the cache is stale once an app was installed, removed or updated in one of the apps folders
+// after it was written - those change the folder's own modification time.
+// Profile changes inside apps aren't covered, the background rescan after startup picks those up.
+fn is_installed_browsers_cache_stale(cache_path: &Path) -> bool {
+    let modified = |path: &Path| fs::metadata(path).and_then(|m| m.modified()).ok();
+
+    let Some(cache_modified) = modified(cache_path) else {
+        return true;
+    };
+
+    apps_dirs()
+        .iter()
+        .filter_map(|dir| modified(dir))
+        .any(|dir_modified| dir_modified > cache_modified)
+}
+
+#[cfg(target_os = "macos")]
+fn apps_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("/Applications")];
+    if let Some(home_dir) = dirs::home_dir() {
+        dirs.push(home_dir.join("Applications"));
+    }
+    dirs
+}
+
+#[cfg(not(target_os = "macos"))]
+fn apps_dirs() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /*const fn create_circular_mask_radius<const N: usize>() -> [[bool; N]; N] {

@@ -63,6 +63,7 @@ pub struct UIVisualSettings {
 #[derive(Clone, Debug)]
 pub struct UIBehavioralSettings {
     pub unwrap_urls: bool,
+    pub run_in_background: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +119,7 @@ fn map_as_visual_settings(ui_config: &UIConfig) -> UIVisualSettings {
 fn map_as_ui_behavioural_settings(behavior: &BehavioralConfig) -> UIBehavioralSettings {
     UIBehavioralSettings {
         unwrap_urls: behavior.unwrap_urls,
+        run_in_background: behavior.run_in_background,
     }
 }
 

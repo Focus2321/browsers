@@ -15,7 +15,8 @@ use browsers::gui::app::UiHandle;
 use browsers::utils::OSAppFinder;
 use browsers::{
     MessageToMain, UrlOpenContext, generate_all_browser_profiles, get_opening_rules,
-    open_link_if_matching_rule, prepare_ui, print_visible_options, unwrap_url, utils,
+    load_installed_browsers, open_link_if_matching_rule, prepare_ui, print_visible_options,
+    unwrap_url, utils,
 };
 use browsers::{handle_messages_to_main, paths};
 
@@ -100,8 +101,11 @@ fn main() {
     let config = app_finder.load_config();
     let mut opening_rules_and_default_profile = get_opening_rules(&config);
 
+    // the cached list keeps startup fast, the message handler rescans in the background if so
+    let (installed_browsers, installed_browsers_from_cache) =
+        load_installed_browsers(&app_finder, force_reload);
     let mut visible_and_hidden_profiles =
-        generate_all_browser_profiles(&config, &app_finder, force_reload);
+        generate_all_browser_profiles(&config, &app_finder, &installed_browsers);
 
     let behavioral_settings = config.get_behavior();
     // TODO: url should not be considered here in case of macos
@@ -159,12 +163,15 @@ fn main() {
         let open_urls_sender = main_sender.clone();
         let open_urls_state = state.clone();
         bridge.set_open_urls_handler(move |sender_bundle_id, url| {
-            let unwrap_urls = open_urls_state
+            let behavioral_settings = open_urls_state
                 .borrow()
                 .ui_settings
                 .behavioral_settings
-                .unwrap_urls;
-            let behavioral_config = utils::BehavioralConfig { unwrap_urls };
+                .clone();
+            let behavioral_config = utils::BehavioralConfig {
+                unwrap_urls: behavioral_settings.unwrap_urls,
+                run_in_background: behavioral_settings.run_in_background,
+            };
             let _ = open_urls_sender.send(MessageToMain::UrlPassedToMain(
                 sender_bundle_id.unwrap_or_default(),
                 url,
@@ -174,12 +181,16 @@ fn main() {
     }
 
     let ui_handle = UiHandle::new(&state);
+    let handler_sender = main_sender.clone();
     thread::spawn(move || {
         handle_messages_to_main(
             main_receiver,
+            handler_sender,
             ui_handle,
             &mut opening_rules_and_default_profile,
             &mut visible_and_hidden_profiles,
+            installed_browsers,
+            installed_browsers_from_cache,
             &app_finder,
         );
     });

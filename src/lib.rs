@@ -4,7 +4,9 @@ use std::fmt::Debug;
 use std::process::{Command, exit};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 use url::form_urlencoded::Parse;
@@ -336,7 +338,7 @@ impl CommonBrowserProfile {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct InstalledBrowser {
     // In Linux:
     //  "env",
@@ -372,7 +374,7 @@ pub struct InstalledBrowser {
     restricted_domains: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct InstalledAppProfiles {
     pub(crate) profiles_type: InstalledAppProfilesType,
     pub(crate) profiles: Vec<InstalledBrowserProfile>,
@@ -414,7 +416,7 @@ enum InstalledAppProfilesType {
     PlaceholderProfiles,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct InstalledBrowserProfile {
     profile_cli_arg_value: String,
     profile_cli_container_name: Option<String>,
@@ -555,13 +557,33 @@ fn to_opening_rules(config_rules: &Vec<ConfigRule>) -> Vec<OpeningRule> {
         .collect();
 }
 
+// returns the installed apps, and whether they came from the cache - in which case a background
+// rescan (see rescan_installed_browsers_in_background) should follow to pick up profile changes
+#[instrument(skip_all)]
+pub fn load_installed_browsers(
+    app_finder: &OSAppFinder,
+    force_reload: bool,
+) -> (Vec<InstalledBrowser>, bool) {
+    return app_finder.get_installed_browsers_cached(force_reload);
+}
+
+// scans in a separate thread, so a cached list can be shown right away.
+// The result comes back as MessageToMain::InstalledBrowsersScanned.
+pub fn rescan_installed_browsers_in_background(main_sender: Sender<MessageToMain>) {
+    thread::spawn(move || {
+        let started = Instant::now();
+        let installed_browsers = OSAppFinder::new().rescan_installed_browsers();
+        debug!("Background rescan took {} ms", started.elapsed().as_millis());
+        let _ = main_sender.send(MessageToMain::InstalledBrowsersScanned(installed_browsers));
+    });
+}
+
 #[instrument(skip_all)]
 pub fn generate_all_browser_profiles(
     config: &Config,
     app_finder: &OSAppFinder,
-    force_reload: bool,
+    installed_browsers: &[InstalledBrowser],
 ) -> VisibleAndHiddenProfiles {
-    let installed_browsers = app_finder.get_installed_browsers_cached(force_reload);
     let hidden_apps = config.get_hidden_apps();
     let hidden_profiles = config.get_hidden_profiles();
 
@@ -666,26 +688,56 @@ pub fn unwrap_url(url_str: &str, behavioral_settings: &BehavioralConfig) -> Stri
     return transformed_url.unwrap_or(url_str.to_string());
 }
 
+// while running in the background, rescan the installed apps at most this often
+// (triggered by an incoming link, so the scan never runs while nobody is using the app)
+const RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
 pub fn handle_messages_to_main(
     main_receiver: Receiver<MessageToMain>,
+    main_sender: Sender<MessageToMain>,
     ui_event_sink: UiHandle,
     opening_rules_and_default_profile: &mut OpeningRulesAndDefaultProfile,
     visible_and_hidden_profiles: &mut VisibleAndHiddenProfiles,
+    mut installed_browsers: Vec<InstalledBrowser>,
+    rescan_pending: bool,
     app_finder: &OSAppFinder,
 ) {
+    let mut rescan_in_flight = rescan_pending;
+    let mut last_scan = Instant::now();
+    if rescan_pending {
+        rescan_installed_browsers_in_background(main_sender.clone());
+    }
+
     for message in main_receiver.iter() {
         match message {
             MessageToMain::Refresh => {
                 info!("refresh called");
 
+                installed_browsers = app_finder.rescan_installed_browsers();
+                last_scan = Instant::now();
+
                 let config = app_finder.load_config();
+                *visible_and_hidden_profiles =
+                    generate_all_browser_profiles(&config, &app_finder, &installed_browsers);
 
-                let visible_and_hidden_profiles =
-                    generate_all_browser_profiles(&config, &app_finder, true);
+                send_all_browsers_to_ui(visible_and_hidden_profiles, &ui_event_sink);
+            }
+            MessageToMain::InstalledBrowsersScanned(scanned_browsers) => {
+                rescan_in_flight = false;
+                last_scan = Instant::now();
 
-                let ui_browsers =
-                    real_to_ui_browsers(&visible_and_hidden_profiles.visible_browser_profiles);
-                ui_event_sink.new_browsers_received(ui_browsers);
+                if scanned_browsers == installed_browsers {
+                    debug!("Installed apps unchanged after rescan");
+                    continue;
+                }
+                info!("Installed apps changed, updating the list");
+                installed_browsers = scanned_browsers;
+
+                let config = app_finder.load_config();
+                *visible_and_hidden_profiles =
+                    generate_all_browser_profiles(&config, &app_finder, &installed_browsers);
+
+                send_all_browsers_to_ui(visible_and_hidden_profiles, &ui_event_sink);
             }
             MessageToMain::OpenLink(profile_index, incognito_mode, url) => {
                 let option = &visible_and_hidden_profiles
@@ -703,6 +755,11 @@ pub fn handle_messages_to_main(
                 ui_event_sink.cleaned_url_opened(url_open_info);
             }
             MessageToMain::UrlPassedToMain(from_bundle_id, url, behavioral_config) => {
+                if !rescan_in_flight && last_scan.elapsed() >= RESCAN_INTERVAL {
+                    rescan_in_flight = true;
+                    rescan_installed_browsers_in_background(main_sender.clone());
+                }
+
                 let new_modified_url = unwrap_url(url.as_str(), &behavioral_config);
 
                 let url_open_info = UrlOpenInfo {
@@ -912,6 +969,7 @@ pub fn handle_messages_to_main(
                 info!("Saving Behavioral settings");
                 let behavioral_config = BehavioralConfig {
                     unwrap_urls: settings.unwrap_urls,
+                    run_in_background: settings.run_in_background,
                 };
 
                 let mut config = app_finder.load_config();
@@ -922,6 +980,18 @@ pub fn handle_messages_to_main(
     }
 
     info!("Exiting waiting thread");
+}
+
+fn send_all_browsers_to_ui(
+    visible_and_hidden_profiles: &VisibleAndHiddenProfiles,
+    ui_event_sink: &UiHandle,
+) {
+    let ui_browsers = real_to_ui_browsers(&visible_and_hidden_profiles.visible_browser_profiles);
+    ui_event_sink.new_browsers_received(ui_browsers);
+
+    let ui_hidden_browsers =
+        real_to_ui_browsers(&visible_and_hidden_profiles.hidden_browser_profiles);
+    ui_event_sink.new_hidden_browsers_received(ui_hidden_browsers);
 }
 
 pub struct PreparedUi {
@@ -1092,6 +1162,8 @@ pub enum MoveTo {
 #[derive(Debug)]
 pub enum MessageToMain {
     Refresh,
+    // result of rescan_installed_browsers_in_background
+    InstalledBrowsersScanned(Vec<InstalledBrowser>),
     OpenLink(usize, bool, String),
     // UrlOpenRequest is almost like LinkOpenedFromBundle, but triggers gui, not from gui
     UrlOpenRequest(String, String),
