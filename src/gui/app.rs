@@ -340,8 +340,12 @@ pub fn reposition_main_window(state: &SharedState) {
     let size = apply_main_window_size(&win, browser_count);
     let position = main_window::calculate_window_position(mouse, work_area, size);
 
-    win.window()
-        .set_position(slint::LogicalPosition::new(position.x, position.y));
+    // the mouse position is fractional, and a window at a fractional position got a backing
+    // surface one pixel wider than its size, which winit then kept correcting back and forth
+    win.window().set_position(slint::LogicalPosition::new(
+        position.x.round(),
+        position.y.round(),
+    ));
 }
 
 // resizes for the current browser count without moving it - for refreshing an already-visible
@@ -683,6 +687,14 @@ where
         };
         match win.window().winit_window().await {
             Ok(winit_window) => f(winit_window),
+            // expected with a non-winit backend, e.g. SLINT_BACKEND=headless for the MCP server
+            Err(err)
+                if err
+                    .to_string()
+                    .contains("not backed by a Winit window adapter") =>
+            {
+                tracing::debug!("{warn_msg}: {err}")
+            }
             Err(err) => tracing::warn!("{warn_msg}: {err}"),
         }
     });
