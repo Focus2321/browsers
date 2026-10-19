@@ -129,8 +129,9 @@ pub fn to_restorable_profile(b: &UIBrowser) -> RestorableProfile {
     }
 }
 
-// first letter of the profile name, for the colored circle shown when a profile has no picture
-fn profile_initial(profile_name: &str) -> String {
+// first letter of the profile name, for the colored circle shown when a profile has no picture.
+// shared with the native popup, see macos::native_popup
+pub fn profile_initial(profile_name: &str) -> String {
     profile_name
         .chars()
         .find(|c| c.is_alphanumeric())
@@ -138,8 +139,9 @@ fn profile_initial(profile_name: &str) -> String {
         .unwrap_or_default()
 }
 
-// picks a stable color per profile, so the same profile keeps its color across launches
-fn avatar_color(unique_id: &str) -> Color {
+// picks a stable color per profile, so the same profile keeps its color across launches (and in
+// both popups)
+fn avatar_rgb(unique_id: &str) -> (u8, u8, u8) {
     const COLORS: [(u8, u8, u8); 8] = [
         (0x7c, 0x5c, 0xe6), // violet
         (0xd9, 0x66, 0x3a), // orange
@@ -154,8 +156,18 @@ fn avatar_color(unique_id: &str) -> Color {
     let hash = unique_id
         .bytes()
         .fold(0x811c_9dc5_u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193));
-    let (r, g, b) = COLORS[hash as usize % COLORS.len()];
+    COLORS[hash as usize % COLORS.len()]
+}
+
+fn avatar_color(unique_id: &str) -> Color {
+    let (r, g, b) = avatar_rgb(unique_id);
     Color::from_rgb_u8(r, g, b)
+}
+
+// the same color as "#rrggbb", for the native popup
+pub fn avatar_color_hex(unique_id: &str) -> String {
+    let (r, g, b) = avatar_rgb(unique_id);
+    format!("#{r:02x}{g:02x}{b:02x}")
 }
 
 // type-to-filter: keeps the browsers whose profile or app name contains the query, ignoring case
@@ -282,6 +294,18 @@ mod tests {
             ("example.com".to_string(), String::new())
         );
         assert_eq!(split_url_for_header(""), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn test_avatar_color_hex_matches_avatar_color() {
+        let id = "/Applications/Google Chrome.app#Profile 1";
+        let hex = avatar_color_hex(id);
+        let color = avatar_color(id);
+        assert_eq!(
+            hex,
+            format!("#{:02x}{:02x}{:02x}", color.red(), color.green(), color.blue())
+        );
+        assert_eq!(hex.len(), 7);
     }
 
     #[test]

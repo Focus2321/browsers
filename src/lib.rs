@@ -1080,6 +1080,7 @@ pub fn handle_messages_to_main(
                     quit_on_lost_focus: settings.quit_on_lost_focus,
                     theme: settings.theme,
                     non_browser_banner_dismissed: settings.non_browser_banner_dismissed,
+                    native_popup: settings.native_popup,
                 };
 
                 let mut config = app_finder.load_config();

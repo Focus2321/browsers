@@ -63,6 +63,7 @@ pub struct UIVisualSettings {
     pub quit_on_lost_focus: bool,
     pub theme: ConfiguredTheme,
     pub non_browser_banner_dismissed: bool,
+    pub native_popup: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +131,7 @@ fn map_as_visual_settings(ui_config: &UIConfig) -> UIVisualSettings {
         quit_on_lost_focus: ui_config.quit_on_lost_focus,
         theme: ui_config.theme,
         non_browser_banner_dismissed: ui_config.non_browser_banner_dismissed,
+        native_popup: ui_config.native_popup,
     }
 }
 

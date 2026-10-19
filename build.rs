@@ -41,10 +41,110 @@ fn compile_slint_files() {
     slint_build::compile("ui/app.slint").unwrap();
 }
 
+// runs a command and returns its trimmed stdout, panicking with its stderr if it fails
+#[cfg(target_os = "macos")]
+fn command_output(program: &str, args: &[&str]) -> String {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("could not run {program}: {err}"));
+    if !output.status.success() {
+        panic!(
+            "{program} {} failed:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+// compiles the native (SwiftUI) popup in native/macos/BrowsersPopup/ into a static library and
+// links it, together with the Swift runtime.
+// Only needs swiftc from the Command Line Tools, no Xcode project.
+#[cfg(target_os = "macos")]
+fn compile_swift_popup() {
+    const ROOT_DIR: &str = env!("CARGO_MANIFEST_DIR");
+    let swift_dir = Path::new(ROOT_DIR)
+        .join("native")
+        .join("macos")
+        .join("BrowsersPopup");
+    println!("cargo:rerun-if-changed={}", swift_dir.display());
+
+    let mut swift_files: Vec<PathBuf> = fs::read_dir(&swift_dir)
+        .unwrap_or_else(|err| panic!("could not read {}: {err}", swift_dir.display()))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "swift"))
+        .collect();
+    swift_files.sort();
+    if swift_files.is_empty() {
+        panic!("no .swift files in {}", swift_dir.display());
+    }
+    for file in &swift_files {
+        println!("cargo:rerun-if-changed={}", file.display());
+    }
+
+    let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        other => panic!("the native popup can't be built for the {other} architecture"),
+    };
+    // the popup needs macOS 13 (SwiftUI), even though the app itself still runs on older macOS
+    // versions, which fall back to the Slint popup at runtime (see native_popup::is_supported)
+    let target = format!("{arch}-apple-macos13.0");
+
+    let sdk_path = command_output("xcrun", &["--show-sdk-path"]);
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let library_path = out_dir.join("libBrowsersPopup.a");
+    // keeps swiftc's module cache out of the user's home folder
+    let module_cache_path = out_dir.join("swift-module-cache");
+
+    let output = std::process::Command::new("swiftc")
+        .args(["-parse-as-library", "-module-name", "BrowsersPopup"])
+        .args(["-emit-library", "-static", "-O"])
+        .args(["-target", &target, "-sdk", &sdk_path])
+        .arg("-module-cache-path")
+        .arg(&module_cache_path)
+        .arg("-o")
+        .arg(&library_path)
+        .args(&swift_files)
+        .output()
+        .unwrap_or_else(|err| panic!("could not run swiftc (install the Xcode Command Line Tools with `xcode-select --install`): {err}"));
+    if !output.status.success() {
+        panic!(
+            "compiling the native popup (native/macos/BrowsersPopup/*.swift) failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=BrowsersPopup");
+
+    // the Swift runtime: the toolchain's compatibility libraries and the SDK's .tbd stubs at link
+    // time, the OS copy in /usr/lib/swift at runtime
+    let swift_bin = command_output("xcrun", &["--toolchain", "default", "--find", "swift"]);
+    let toolchain_lib = Path::new(&swift_bin)
+        .parent()
+        .and_then(|bin| bin.parent())
+        .map(|usr| usr.join("lib").join("swift").join("macosx"))
+        .expect("unexpected swift path");
+    println!("cargo:rustc-link-search=native={}", toolchain_lib.display());
+    println!("cargo:rustc-link-search=native={sdk_path}/usr/lib/swift");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+
+    // weak, so the app still launches on macOS versions without SwiftUI (before 10.15) or without
+    // the Swift runtime in the OS (before 10.14.4).
+    // The other Swift libraries the objects autolink already come out weak, libswiftCore doesn't.
+    println!("cargo:rustc-link-arg=-Wl,-weak_framework,SwiftUI");
+    println!("cargo:rustc-link-arg=-Wl,-weak-lswiftCore");
+    println!("cargo:rustc-link-lib=framework=AppKit");
+}
+
 #[cfg(target_os = "macos")]
 fn main() {
     compile_slint_files();
     copy_resources();
+    compile_swift_popup();
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
     const ROOT_DIR: &str = env!("CARGO_MANIFEST_DIR");
