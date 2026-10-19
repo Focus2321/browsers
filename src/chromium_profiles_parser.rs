@@ -5,7 +5,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{InstalledBrowserProfile, paths, utils};
 
@@ -42,7 +42,17 @@ pub fn find_chromium_profiles(
             .map(|image_file_path_from_config| {
                 let image_file_path = chromium_user_dir.join(image_file_path_from_config);
                 if image_file_path.exists() {
-                    let png_file = File::open(image_file_path.as_path()).unwrap();
+                    let png_file = match File::open(image_file_path.as_path()) {
+                        Ok(png_file) => png_file,
+                        Err(err) => {
+                            warn!(
+                                "Could not open profile avatar {}: {}",
+                                image_file_path.display(),
+                                err
+                            );
+                            return None;
+                        }
+                    };
                     let mut png_file_reader = BufReader::new(png_file);
                     let mut buffer = Vec::new();
                     // Read file into vector
@@ -87,10 +97,11 @@ impl ChromeInfoCacheMap {
     }
 
     fn profiles_info_cache_map(local_state_file_path: &Path) -> Map<String, Value> {
-        // Open the file in read-only mode with buffer.
-        let file = File::open(local_state_file_path).unwrap();
-        let reader = BufReader::new(file);
-        let v: Value = serde_json::from_reader(reader).unwrap();
+        // unreadable (e.g denied by macOS App Data protection) or corrupt means "no profiles",
+        // so the app still shows up with its placeholder profile
+        let Some(v) = utils::read_json_file(local_state_file_path) else {
+            return Map::new();
+        };
         let profiles = &v["profile"];
         let info_cache = &profiles["info_cache"];
         // A freshly installed but never-launched browser can have a `Local State`

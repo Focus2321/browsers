@@ -1,12 +1,10 @@
 use std::fs;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 
 use serde_json::{Map, Value};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::{InstalledBrowserProfile, paths};
+use crate::{InstalledBrowserProfile, paths, utils};
 
 pub fn find_slack_profiles(
     slack_user_dir: &Path,
@@ -91,13 +89,21 @@ impl SlackWorkspacesMap {
     }
 
     fn workspaces_map(local_state_file_path: &Path) -> Map<String, Value> {
-        // Open the file in read-only mode with buffer.
-        let file = File::open(local_state_file_path).unwrap();
-        let reader = BufReader::new(file);
-        let v: Value = serde_json::from_reader(reader).unwrap();
-        let workspaces = &v["workspaces"];
-        let workspaces_map = workspaces.as_object().unwrap();
-        return workspaces_map.to_owned();
+        // unreadable (e.g denied by macOS App Data protection) or unexpected content means
+        // "no workspaces", so Slack still shows up with its placeholder profile
+        let Some(v) = utils::read_json_file(local_state_file_path) else {
+            return Map::new();
+        };
+        match v["workspaces"].as_object() {
+            Some(workspaces_map) => workspaces_map.to_owned(),
+            None => {
+                warn!(
+                    "No workspaces found in {}, treating as no profiles",
+                    local_state_file_path.display()
+                );
+                Map::new()
+            }
+        }
     }
 
     pub fn parse_profiles(self) -> Vec<SlackWorkspace> {
@@ -114,7 +120,7 @@ impl SlackWorkspacesMap {
 
             let name = workspace["name"].as_str().unwrap_or("").to_string();
 
-            let icon = workspace["icon"].as_object().unwrap();
+            let icon = &workspace["icon"];
             let image_68 = icon["image_68"].as_str().unwrap_or("").to_string();
             let image_88 = icon["image_88"].as_str().unwrap_or("").to_string();
 

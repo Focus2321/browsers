@@ -7,7 +7,7 @@ use image::imageops::FilterType;
 use image::{ImageFormat, Rgba};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[cfg(target_os = "linux")]
 use crate::linux::linux_utils;
@@ -391,6 +391,28 @@ impl OSAppFinder {
         }
     };
 }*/
+
+// reads and parses a JSON file another app owns (a browser's `Local State`, Slack's root state,
+// ...), logging a warning instead of panicking when it can't.
+// Reading those can fail even when the file exists, e.g. macOS "App Data" protection (TCC) lets
+// stat() succeed but denies open() with EPERM - so callers fall back to "no profiles" instead.
+pub fn read_json_file(path: &Path) -> Option<serde_json::Value> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            warn!("Could not open {}: {}", path.display(), err);
+            return None;
+        }
+    };
+
+    match serde_json::from_reader(BufReader::new(file)) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            warn!("Could not parse {} as JSON: {}", path.display(), err);
+            None
+        }
+    }
+}
 
 //const CIRCULAR_MASK_32: [[bool; 64]; 64] = create_circular_mask_radius();
 const CIRCULAR_RADIUS: usize = 64;
