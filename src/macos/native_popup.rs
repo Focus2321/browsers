@@ -119,11 +119,7 @@ impl<'a> PopupState<'a> {
             source_app_name,
             show_hotkeys,
             show_set_as_default,
-            appearance: match theme {
-                ConfiguredTheme::Auto => "system",
-                ConfiguredTheme::Light => "light",
-                ConfiguredTheme::Dark => "dark",
-            },
+            appearance: appearance(theme),
             browsers: browsers
                 .iter()
                 .map(|b| PopupBrowser {
@@ -170,6 +166,16 @@ impl<'a> PopupState<'a> {
     }
 }
 
+// the theme as the native windows name it: their NSWindow appearance follows it (also used by
+// native_settings)
+pub fn appearance(theme: ConfiguredTheme) -> &'static str {
+    match theme {
+        ConfiguredTheme::Auto => "system",
+        ConfiguredTheme::Light => "light",
+        ConfiguredTheme::Dark => "dark",
+    }
+}
+
 // SwiftUI as used by the popup needs macOS 13
 pub fn is_supported() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
@@ -181,12 +187,16 @@ pub fn is_supported() -> bool {
     })
 }
 
-// why the Slint popup is used no matter what the setting says, if anything.
+// why the Slint popup (and the Slint Settings/About, see native_settings::init) is used no matter
+// what the setting says, if anything.
 // SLINT_BACKEND=headless is the MCP-driven UI test mode (see CLAUDE.md), which can only see Slint
 // windows.
+// BROWSERS_UI=slint forces Slint everywhere, BROWSERS_POPUP=slint is its older name.
 pub fn unavailable_reason() -> Option<&'static str> {
     if std::env::var("SLINT_BACKEND").is_ok_and(|backend| backend == "headless") {
         Some("SLINT_BACKEND=headless")
+    } else if std::env::var("BROWSERS_UI").is_ok_and(|ui| ui == "slint") {
+        Some("BROWSERS_UI=slint")
     } else if std::env::var("BROWSERS_POPUP").is_ok_and(|popup| popup == "slint") {
         Some("BROWSERS_POPUP=slint")
     } else if !is_supported() {

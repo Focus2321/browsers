@@ -1,37 +1,29 @@
+// the Settings window: the Slint one here, or the native one on macOS 13+ (macos::native_settings).
+// Both show the same gui::settings_model and call the same handlers below, so only drawing differs.
+
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use slint::{Color, ComponentHandle, Image, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::gui::app::{self, SharedState};
-use crate::gui::app_state::{UIBrowser, UIProfileAndIncognito, UISettingsRule};
+use crate::gui::app_state::UIProfileAndIncognito;
 use crate::gui::generated::{
     Palette as StdWidgetPalette, SettingsBrowserRow, SettingsRuleRow, SettingsWindow, ThemeChoice,
 };
 use crate::gui::icon_loader::IconLoader;
+use crate::gui::settings_model::{
+    self, BrowserRow, BrowsersView, Draft, RowAction, RowKind, RowList, RowMeta, RulesView,
+    SettingsModel, TargetDisplay, block_end, drop_target, join_names, move_item, retarget,
+    snap_drop_index,
+};
 use crate::gui::theme::ColorScheme;
 use crate::gui::ui_util::sync_vec_model;
-use crate::utils::ConfiguredTheme;
-use crate::{MessageToMain, RuleTestOutcome, paths, profile_order, utils};
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-// apps that commonly send links, offered as a rule's source app even when they aren't link
-// openers themselves (so they never show up among the found apps)
 #[cfg(target_os = "macos")]
-const KNOWN_SOURCE_APPS: &[(&str, &str)] = &[
-    ("Mail", "com.apple.mail"),
-    ("Messages", "com.apple.MobileSMS"),
-    ("Notes", "com.apple.Notes"),
-    ("Calendar", "com.apple.iCal"),
-    ("Terminal", "com.apple.Terminal"),
-    ("Outlook", "com.microsoft.Outlook"),
-    ("Microsoft Teams", "com.microsoft.teams2"),
-    ("Discord", "com.hnc.Discord"),
-];
-#[cfg(not(target_os = "macos"))]
-const KNOWN_SOURCE_APPS: &[(&str, &str)] = &[];
+use crate::macos::native_settings::{self, SettingsEvent};
+use crate::utils::ConfiguredTheme;
+use crate::{MessageToMain, paths, utils};
 
 const LETTER_COLORS: &[(u8, u8, u8)] = &[
     (0x5b, 0x8d, 0xef),
@@ -43,71 +35,6 @@ const LETTER_COLORS: &[(u8, u8, u8)] = &[
     (0x4b, 0xb3, 0xc4),
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum RowKind {
-    Single,
-    Header,
-    Child,
-}
-
-impl RowKind {
-    fn as_int(self) -> i32 {
-        match self {
-            RowKind::Single => 0,
-            RowKind::Header => 1,
-            RowKind::Child => 2,
-        }
-    }
-}
-
-// what a row of the Browsers list stands for
-#[derive(Clone, Debug)]
-struct RowMeta {
-    kind: RowKind,
-    // every profile id the row moves/hides together, in popup order.
-    // For a header that includes the group's hidden profiles too, even when they aren't shown.
-    ids: Vec<String>,
-    app_id: String,
-    hidden: bool,
-}
-
-// the rule being added on the Rules page, kept out of the saved rules until it's complete
-#[derive(Clone, Debug, Default)]
-struct Draft {
-    pattern: String,
-    source_app: String,
-    // None until a target is picked; Some(None) is "Show the picker"
-    opener: Option<Option<String>>,
-    // only flag a bad pattern once the user is done typing it
-    show_invalid: bool,
-}
-
-impl Draft {
-    fn as_rule(&self) -> UISettingsRule {
-        UISettingsRule {
-            source_app: self.source_app.clone(),
-            url_pattern: self.pattern.trim().to_string(),
-            opener: self
-                .opener
-                .clone()
-                .flatten()
-                .map(|profile| UIProfileAndIncognito {
-                    profile,
-                    incognito: false,
-                }),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.opener.is_some() && self.as_rule().has_valid_matcher()
-    }
-
-    fn pattern_is_invalid(&self) -> bool {
-        let pattern = self.pattern.trim();
-        !pattern.is_empty() && !crate::url_rule::is_valid_pattern(pattern)
-    }
-}
-
 // window-local state that only Settings cares about
 #[derive(Default)]
 struct Local {
@@ -115,6 +42,7 @@ struct Local {
     show_hidden: bool,
     // app ids of collapsed groups
     collapsed: HashSet<String>,
+    // the rows last shown, what row events refer to
     rows: Vec<RowMeta>,
     special_rows: Vec<RowMeta>,
     // every orderable (non-priority) profile id in popup order, hidden ones included
@@ -127,7 +55,10 @@ struct Local {
     target_ids: Vec<Option<String>>,
     // parallel to the source-options shown in pickers: "" = any app
     source_ids: Vec<String>,
-    source_labels: Vec<String>,
+    // rule index -> the invalid text last typed into its pattern, which isn't saved.
+    // Indexes shift when rules move, so this is cleared whenever the list changes shape.
+    rule_pattern_edits: HashMap<usize, String>,
+    is_default_browser: bool,
     default_browser_poll: Option<Timer>,
 }
 
@@ -137,6 +68,16 @@ thread_local! {
 
 fn with_local<R>(f: impl FnOnce(&mut Local) -> R) -> R {
     LOCAL.with(|local| f(&mut local.borrow_mut()))
+}
+
+// a fresh window starts out unfiltered, without a draft or a test link
+fn reset_local() {
+    with_local(|local| {
+        *local = Local {
+            is_default_browser: utils::is_default_web_browser(),
+            ..Local::default()
+        }
+    });
 }
 
 // forces std-widgets' own Palette (which otherwise just tracks the OS) so an explicit Light/Dark
@@ -166,7 +107,23 @@ fn choice_to_theme(choice: ThemeChoice) -> ConfiguredTheme {
     }
 }
 
+// lets debug builds' screenshots start on any page (0-3: browsers, rules, general, about)
+fn debug_page() -> Option<usize> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var("BROWSERS_DEBUG_SETTINGS_PAGE")
+        .ok()
+        .and_then(|p| p.parse().ok())
+}
+
 pub fn open(state: &SharedState) {
+    #[cfg(target_os = "macos")]
+    if native_settings::is_initialized() {
+        open_native(state);
+        return;
+    }
+
     // state.settings_window gets cleared to None on actual close, so Some here only ever means
     // "currently showing"
     let already_open = state
@@ -196,25 +153,15 @@ pub fn open(state: &SharedState) {
             .icons
             .load(&paths::get_app_icon_path().to_string_lossy()),
     );
-    win.set_version_text(format!("Version {}", VERSION).into());
-    win.set_show_quit_on_lost_focus(cfg!(target_os = "macos"));
-    #[cfg(target_os = "macos")]
-    win.set_show_native_popup(crate::macos::native_popup::is_supported());
-    win.set_is_default_browser(utils::is_default_web_browser());
+    win.set_version_text(crate::gui::about_window::version_text().into());
     win.set_debug_hold_drag(
         cfg!(debug_assertions) && std::env::var_os("BROWSERS_DEBUG_HOLD_DRAG").is_some(),
     );
-    if cfg!(debug_assertions) {
-        // lets screenshots start on any page
-        if let Some(page) = std::env::var("BROWSERS_DEBUG_SETTINGS_PAGE")
-            .ok()
-            .and_then(|p| p.parse().ok())
-        {
-            win.set_page(page);
-        }
+    if let Some(page) = debug_page() {
+        win.set_page(page as i32);
     }
 
-    with_local(|local| *local = Local::default());
+    reset_local();
     state.borrow_mut().settings_window = Some(win.clone_strong());
 
     app::apply_theme(state);
@@ -229,6 +176,18 @@ pub fn open(state: &SharedState) {
     app::clear_on_close(&win, state, |st| st.settings_window = None);
 }
 
+// opening a closed window starts it over, an open one just comes to the front with fresh state
+#[cfg(target_os = "macos")]
+fn open_native(state: &SharedState) {
+    if !native_settings::settings_is_open() {
+        reset_local();
+    }
+    let page =
+        debug_page().and_then(|page| ["browsers", "rules", "general", "about"].get(page).copied());
+    let json = native_state_json(state);
+    native_settings::settings_show(&json, page);
+}
+
 fn settings_window(state: &SharedState) -> Option<SettingsWindow> {
     state
         .borrow()
@@ -237,127 +196,33 @@ fn settings_window(state: &SharedState) -> Option<SettingsWindow> {
         .map(|w| w.clone_strong())
 }
 
+// shows the current state in whichever Settings window is open
 pub fn refresh(state: &SharedState) {
+    #[cfg(target_os = "macos")]
+    if native_settings::is_initialized() {
+        refresh_native(state);
+        return;
+    }
     let Some(win) = settings_window(state) else {
         return;
     };
-    refresh_browsers(state, &win);
-    refresh_rules(state, &win);
-    refresh_general(state, &win);
+    let model = build_model(state);
+    apply_to_slint(state, &win, &model);
 }
 
-// ------------------------------------------------------------------------------------ Browsers
-
-struct Entry<'a> {
-    browser: &'a UIBrowser,
-    hidden: bool,
-}
-
-fn matches_filter(text: &str, filter: &str) -> bool {
-    filter.is_empty() || text.to_lowercase().contains(filter)
-}
-
-fn letter_color(name: &str) -> Color {
-    let hash = name
-        .bytes()
-        .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
-    let (r, g, b) = LETTER_COLORS[hash % LETTER_COLORS.len()];
-    Color::from_rgb_u8(r, g, b)
-}
-
-fn first_letter(name: &str) -> String {
-    name.chars()
-        .find(|c| c.is_alphanumeric())
-        .map(|c| c.to_uppercase().to_string())
-        .unwrap_or_default()
-}
-
-fn loaded(image: Image) -> Option<Image> {
-    (image.size().width > 0).then_some(image)
-}
-
-// a single app or one app profile as a list row
-fn entry_row(
-    entry: &Entry,
-    kind: RowKind,
-    icons: &mut IconLoader,
-    default_profile: Option<&str>,
-    draggable: bool,
-) -> SettingsBrowserRow {
-    let b = entry.browser;
-    let (name, detail) = match kind {
-        RowKind::Child => (b.profile_name.clone(), String::new()),
-        _ if b.supports_profiles => (b.browser_name.clone(), b.profile_name.clone()),
-        _ => (b.browser_name.clone(), String::new()),
-    };
-    let icon = match kind {
-        // a profile without a picture of its own gets a letter instead of repeating the app icon
-        RowKind::Child => loaded(icons.load(&b.profile_icon_path)),
-        _ => loaded(icons.load(&b.icon_path)),
-    };
-    SettingsBrowserRow {
-        kind: kind.as_int(),
-        letter: first_letter(&name).into(),
-        letter_color: letter_color(&name),
-        name: name.into(),
-        detail: detail.into(),
-        has_icon: icon.is_some(),
-        icon: icon.unwrap_or_default(),
-        hidden: entry.hidden,
-        is_default: default_profile == Some(b.unique_id.as_str()),
-        collapsed: false,
-        draggable,
+#[cfg(target_os = "macos")]
+pub fn refresh_native(state: &SharedState) {
+    if native_settings::settings_is_open() {
+        let json = native_state_json(state);
+        native_settings::settings_update(&json);
     }
 }
 
-// splits the full order into one group per app: an app's profiles are pulled together at the
-// spot of its first one (see profile_order::group_by_app), even if the saved order split them up.
-fn group_entries<'a>(entries: Vec<Entry<'a>>) -> Vec<Vec<Entry<'a>>> {
-    let entries = profile_order::group_by_app(entries, |e| e.browser.unique_app_id.to_string());
-    let mut groups: Vec<Vec<Entry>> = vec![];
-    for entry in entries {
-        match groups.last_mut() {
-            Some(group)
-                if entry.browser.supports_profiles
-                    && group[0].browser.supports_profiles
-                    && group[0].browser.unique_app_id == entry.browser.unique_app_id =>
-            {
-                group.push(entry)
-            }
-            _ => groups.push(vec![entry]),
-        }
-    }
-    groups
-}
-
-fn plural(count: usize, one: &str, many: &str) -> String {
-    if count == 1 {
-        format!("1 {one}")
-    } else {
-        format!("{count} {many}")
-    }
-}
-
-// "Slack", "Slack and Zoom", "Slack, Zoom and Figma", "Slack, Zoom, Figma and 2 more"
-fn join_names(names: &[String]) -> String {
-    match names {
-        [] => String::new(),
-        [only] => only.clone(),
-        [first, second, third, rest @ ..] if !rest.is_empty() => {
-            format!("{first}, {second}, {third} and {} more", rest.len())
-        }
-        [rest @ .., last] => format!("{} and {}", rest.join(", "), last),
-    }
-}
-
-fn relative_time(elapsed: Duration) -> String {
-    let secs = elapsed.as_secs();
-    match secs {
-        0..60 => "just now".to_string(),
-        60..3600 => format!("{} min ago", secs / 60),
-        3600..86400 => format!("{} ago", plural((secs / 3600) as usize, "hour", "hours")),
-        _ => format!("{} ago", plural((secs / 86400) as usize, "day", "days")),
-    }
+// built before calling Swift, so neither AppState nor Local is borrowed while it runs
+#[cfg(target_os = "macos")]
+fn native_state_json(state: &SharedState) -> std::ffi::CString {
+    let model = build_model(state);
+    native_settings::settings_state_json(&model, native_settings::AboutInfo::current())
 }
 
 // when the installed apps were last scanned, from the scan's cache file
@@ -367,300 +232,274 @@ fn last_scan_time() -> Option<SystemTime> {
         .ok()
 }
 
-fn refresh_browsers(state: &SharedState, win: &SettingsWindow) {
-    let mut st = state.borrow_mut();
-    let mut icons = std::mem::take(&mut st.icons);
+fn native_popup_available() -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::macos::native_popup::is_supported();
+    #[cfg(not(target_os = "macos"))]
+    false
+}
 
-    let (filter, show_hidden, collapsed) = with_local(|l| {
-        (
-            l.filter.trim().to_lowercase(),
-            l.show_hidden,
-            l.collapsed.clone(),
-        )
-    });
-    let reorder_enabled = filter.is_empty();
-    let default_profile = st
-        .ui_settings
-        .default_opener
-        .as_ref()
-        .map(|o| o.profile.clone());
-    let default_profile = default_profile.as_deref();
-
+// everything Settings shows, also remembering what the rows and pickers stand for, since the
+// events only carry their positions
+fn build_model(state: &SharedState) -> SettingsModel {
+    let scanned_ago = last_scan_time().and_then(|t| t.elapsed().ok());
+    let st = state.borrow();
     let visible = &st.browsers;
     let hidden = &st.restorable_app_profiles;
-    let ids = |list: &[UIBrowser]| -> Vec<String> {
-        list.iter()
-            .filter(|b| !b.has_priority_ordering())
-            .map(|b| b.unique_id.clone())
-            .collect()
-    };
-    let order =
-        profile_order::full_order(&ids(visible), &ids(hidden), &st.ui_settings.profile_order);
-    let find = |id: &str| -> Option<Entry> {
-        visible
-            .iter()
-            .find(|b| b.unique_id == id)
-            .map(|browser| Entry {
-                browser,
-                hidden: false,
-            })
-            .or_else(|| {
-                hidden
-                    .iter()
-                    .find(|b| b.unique_id == id)
-                    .map(|browser| Entry {
-                        browser,
-                        hidden: true,
-                    })
-            })
-    };
-
-    let mut rows = vec![];
-    let mut metas = vec![];
-    for group in group_entries(order.iter().filter_map(|id| find(id)).collect()) {
-        let first = group[0].browser;
-        let shown = |e: &&Entry| show_hidden || !e.hidden;
-
-        if group.len() == 1 {
-            let entry = &group[0];
-            let text = format!("{} {}", first.browser_name, first.profile_name);
-            if !shown(&entry) || !matches_filter(&text, &filter) {
-                continue;
-            }
-            rows.push(entry_row(
-                entry,
-                RowKind::Single,
-                &mut icons,
-                default_profile,
-                reorder_enabled,
-            ));
-            metas.push(RowMeta {
-                kind: RowKind::Single,
-                ids: vec![first.unique_id.clone()],
-                app_id: first.unique_app_id.clone(),
-                hidden: entry.hidden,
-            });
-            continue;
-        }
-
-        let app_matches = matches_filter(&first.browser_name, &filter);
-        let children: Vec<&Entry> = group
-            .iter()
-            .filter(shown)
-            .filter(|e| app_matches || matches_filter(&e.browser.profile_name, &filter))
-            .collect();
-        if children.is_empty() {
-            continue;
-        }
-
-        let hidden_count = group.iter().filter(|e| e.hidden).count();
-        let mut detail = plural(group.len(), "profile", "profiles");
-        if hidden_count > 0 && !show_hidden {
-            detail = format!("{detail} · {hidden_count} hidden");
-        }
-        let is_collapsed = collapsed.contains(&first.unique_app_id) && filter.is_empty();
-        let icon = loaded(icons.load(&first.icon_path));
-        rows.push(SettingsBrowserRow {
-            kind: RowKind::Header.as_int(),
-            name: first.browser_name.clone().into(),
-            detail: detail.into(),
-            has_icon: icon.is_some(),
-            icon: icon.unwrap_or_default(),
-            letter: first_letter(&first.browser_name).into(),
-            letter_color: letter_color(&first.browser_name),
-            hidden: hidden_count == group.len(),
-            is_default: false,
-            collapsed: is_collapsed,
-            draggable: reorder_enabled,
-        });
-        metas.push(RowMeta {
-            kind: RowKind::Header,
-            ids: group.iter().map(|e| e.browser.unique_id.clone()).collect(),
-            app_id: first.unique_app_id.clone(),
-            hidden: hidden_count == group.len(),
-        });
-
-        if is_collapsed {
-            continue;
-        }
-        for entry in children {
-            rows.push(entry_row(
-                entry,
-                RowKind::Child,
-                &mut icons,
-                default_profile,
-                reorder_enabled,
-            ));
-            metas.push(RowMeta {
-                kind: RowKind::Child,
-                ids: vec![entry.browser.unique_id.clone()],
-                app_id: entry.browser.unique_app_id.clone(),
-                hidden: entry.hidden,
-            });
-        }
-    }
-
-    // apps that only open their own links: always first in the popup, so not draggable
-    let mut special_rows = vec![];
-    let mut special_metas = vec![];
-    let special = visible
-        .iter()
-        .map(|browser| Entry {
-            browser,
-            hidden: false,
-        })
-        .chain(hidden.iter().map(|browser| Entry {
-            browser,
-            hidden: true,
-        }))
-        .filter(|e| e.browser.has_priority_ordering())
-        .filter(|e| show_hidden || !e.hidden)
-        .filter(|e| {
-            let text = format!("{} {}", e.browser.browser_name, e.browser.profile_name);
-            matches_filter(&text, &filter)
-        });
-    for entry in special {
-        special_rows.push(entry_row(
-            &entry,
-            RowKind::Single,
-            &mut icons,
-            default_profile,
-            false,
-        ));
-        special_metas.push(RowMeta {
-            kind: RowKind::Single,
-            ids: vec![entry.browser.unique_id.clone()],
-            app_id: entry.browser.unique_app_id.clone(),
-            hidden: entry.hidden,
-        });
-    }
-
-    // the "these aren't web browsers" banner lists every visible app that only opens its own links
-    let mut banner_names: Vec<String> = vec![];
-    for b in visible.iter().filter(|b| b.has_priority_ordering()) {
-        if !banner_names.contains(&b.browser_name) {
-            banner_names.push(b.browser_name.clone());
-        }
-    }
-    if st.ui_settings.visual_settings.non_browser_banner_dismissed {
-        banner_names.clear();
-    }
-
-    let app_count = visible
-        .iter()
-        .chain(hidden.iter())
-        .map(|b| b.unique_app_id.as_str())
-        .collect::<HashSet<_>>()
-        .len();
-    let found_text = match last_scan_time().and_then(|t| t.elapsed().ok()) {
-        Some(elapsed) => format!(
-            "Found {} · checked {}",
-            plural(app_count, "app", "apps"),
-            relative_time(elapsed)
-        ),
-        None => format!("Found {}", plural(app_count, "app", "apps")),
-    };
-    let hidden_count = hidden.len();
-
-    st.icons = icons;
-    drop(st);
-
+    let settings = &st.ui_settings;
     with_local(|l| {
-        l.rows = metas;
-        l.special_rows = special_metas;
-        l.order = order;
-    });
-
-    win.set_show_hidden(show_hidden);
-    win.set_hidden_count(hidden_count as i32);
-    win.set_reorder_enabled(reorder_enabled);
-    win.set_order_hint(
-        if reorder_enabled {
-            "Drag to reorder · 1–9 follow this order"
-        } else {
-            "Clear the filter to reorder"
+        let browsers = settings_model::browsers_model(
+            visible,
+            hidden,
+            settings,
+            &BrowsersView {
+                filter: &l.filter,
+                show_hidden: l.show_hidden,
+                collapsed: &l.collapsed,
+            },
+            scanned_ago,
+        );
+        let rules = settings_model::rules_model(
+            visible,
+            hidden,
+            settings,
+            &RulesView {
+                draft: l.draft.as_ref(),
+                test_url: &l.test_url,
+                test_source: l.test_source,
+                pattern_edits: &l.rule_pattern_edits,
+            },
+        );
+        l.rows = browsers.rows.iter().map(|r| r.meta.clone()).collect();
+        l.special_rows = browsers
+            .special_rows
+            .iter()
+            .map(|r| r.meta.clone())
+            .collect();
+        l.order = browsers.order.clone();
+        l.test_source = rules.test.source_index;
+        l.target_ids = rules.targets.iter().map(|t| t.id.clone()).collect();
+        l.source_ids = rules.sources.iter().map(|s| s.id.clone()).collect();
+        SettingsModel {
+            is_default_browser: l.is_default_browser,
+            browsers,
+            rules,
+            general: settings_model::general_model(settings, native_popup_available()),
         }
-        .into(),
-    );
-    win.set_banner_count(banner_names.len() as i32);
-    win.set_banner_names(join_names(&banner_names).into());
-    win.set_found_text(found_text.into());
+    })
+}
+
+// ------------------------------------------------------------------------------------ Slint
+
+fn letter_color(name: &str) -> Color {
+    let hash = name
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+    let (r, g, b) = LETTER_COLORS[hash % LETTER_COLORS.len()];
+    Color::from_rgb_u8(r, g, b)
+}
+
+fn loaded(image: Image) -> Option<Image> {
+    (image.size().width > 0).then_some(image)
+}
+
+fn slint_row(row: &BrowserRow, icons: &mut IconLoader) -> SettingsBrowserRow {
+    let icon = loaded(icons.load(&row.icon_path));
+    SettingsBrowserRow {
+        kind: row.meta.kind.as_int(),
+        letter: row.letter.clone().into(),
+        letter_color: letter_color(&row.name),
+        name: row.name.clone().into(),
+        detail: row.detail.clone().into(),
+        has_icon: icon.is_some(),
+        icon: icon.unwrap_or_default(),
+        hidden: row.meta.hidden,
+        is_default: row.is_default,
+        collapsed: row.collapsed,
+        draggable: row.meta.draggable,
+    }
+}
+
+// the profile's picture, else the app icon
+fn target_icon(target: &TargetDisplay, icons: &mut IconLoader) -> Option<Image> {
+    loaded(icons.load(&target.profile_icon_path)).or_else(|| loaded(icons.load(&target.icon_path)))
+}
+
+fn apply_to_slint(state: &SharedState, win: &SettingsWindow, model: &SettingsModel) {
+    let mut icons = std::mem::take(&mut state.borrow_mut().icons);
+
+    let browsers = &model.browsers;
+    let rows: Vec<SettingsBrowserRow> = browsers
+        .rows
+        .iter()
+        .map(|row| slint_row(row, &mut icons))
+        .collect();
+    let special_rows: Vec<SettingsBrowserRow> = browsers
+        .special_rows
+        .iter()
+        .map(|row| slint_row(row, &mut icons))
+        .collect();
+
+    let rules = &model.rules;
+    let rule_rows: Vec<SettingsRuleRow> = rules
+        .rules
+        .iter()
+        .map(|rule| {
+            let icon = target_icon(&rule.target, &mut icons);
+            SettingsRuleRow {
+                pattern: rule.pattern.clone().into(),
+                source_label: rule.source_label.clone().into(),
+                target_label: rule.target.label.clone().into(),
+                target_has_icon: icon.is_some(),
+                target_icon: icon.unwrap_or_default(),
+                private: rule.private,
+                supports_private: rule.target.supports_private,
+            }
+        })
+        .collect();
+    let fallback_icon = target_icon(&rules.fallback.target, &mut icons);
+
+    state.borrow_mut().icons = icons;
+
+    win.set_is_default_browser(model.is_default_browser);
+
+    // ---- Browsers
+    win.set_show_hidden(browsers.show_hidden);
+    win.set_hidden_count(browsers.hidden_count as i32);
+    win.set_reorder_enabled(browsers.reorder_enabled);
+    win.set_order_hint(browsers.order_hint().into());
+    win.set_banner_count(browsers.banner_names.len() as i32);
+    win.set_banner_names(join_names(&browsers.banner_names).into());
+    win.set_found_text(browsers.found_text.clone().into());
     sync_vec_model(&win.get_browser_rows(), rows);
     sync_vec_model(&win.get_special_rows(), special_rows);
+
+    // ---- Rules
+    let target_options: Vec<SharedString> = rules
+        .targets
+        .iter()
+        .map(|t| t.label.clone().into())
+        .collect();
+    let source_options: Vec<SharedString> = rules
+        .sources
+        .iter()
+        .map(|s| s.label.clone().into())
+        .collect();
+    sync_vec_model(&win.get_target_options(), target_options);
+    sync_vec_model(&win.get_source_options(), source_options);
+    sync_vec_model(&win.get_rules(), rule_rows);
+
+    win.set_has_draft(rules.draft.is_some());
+    if let Some(draft) = &rules.draft {
+        win.set_draft_source_label(draft.source_label.clone().into());
+        win.set_draft_target_label(draft.target_label.clone().into());
+        win.set_draft_help(draft.help.clone().into());
+        win.set_draft_pattern_invalid(draft.pattern_invalid);
+    }
+
+    let test = &rules.test;
+    win.set_test_source_label(test.source_label.clone().into());
+    win.set_test_result_kind(test.result_kind.as_int());
+    win.set_test_result_text(test.result_text.clone().into());
+    win.set_matched_rule(test.matched_rule.map_or(-1, |i| i as i32));
+
+    let fallback = &rules.fallback;
+    win.set_fallback_target_label(fallback.target.label.clone().into());
+    win.set_fallback_target_has_icon(fallback_icon.is_some());
+    win.set_fallback_target_icon(fallback_icon.unwrap_or_default());
+    win.set_fallback_private(fallback.private);
+    win.set_fallback_supports_private(fallback.target.supports_private);
+
+    // ---- General
+    let general = &model.general;
+    win.set_show_native_popup(general.native_popup_available);
+    win.set_show_quit_on_lost_focus(general.quit_on_lost_focus_visible);
+    win.set_show_hotkeys(general.show_hotkeys);
+    win.set_quit_on_lost_focus(general.quit_on_lost_focus);
+    win.set_unwrap_urls(general.unwrap_urls);
+    win.set_run_in_background(general.run_in_background);
+    win.set_native_popup(general.native_popup);
+    win.set_theme(theme_to_choice(general.theme));
+    win.global::<StdWidgetPalette>()
+        .set_color_scheme(theme_to_color_scheme(general.theme));
 }
 
-// where a row dragged from `from` lands when released at insertion point `raw` (0..=rows).
-// A profile stays inside its own group; an app or a whole group only lands between other apps
-// and groups, never between someone else's profiles.
-fn snap_drop_index(kinds: &[RowKind], from: usize, raw: usize) -> usize {
-    let n = kinds.len();
-    let raw = raw.min(n);
-    if from >= n {
-        return raw;
-    }
-    if kinds[from] == RowKind::Child {
-        let first = (0..from)
-            .rev()
-            .find(|&i| kinds[i] != RowKind::Child)
-            .map_or(0, |header| header + 1);
-        let end = (from..n).find(|&i| kinds[i] != RowKind::Child).unwrap_or(n);
-        return raw.clamp(first, end);
-    }
-    (0..=n)
-        .filter(|&i| i == n || kinds[i] != RowKind::Child)
-        .min_by_key(|&i| i.abs_diff(raw))
-        .unwrap_or(raw)
-}
-
-// the end (exclusive) of the block of rows starting at `from`: a header and its shown profiles,
-// or just the row itself
-fn block_end(kinds: &[RowKind], from: usize) -> usize {
-    if kinds.get(from) == Some(&RowKind::Header) {
-        (from + 1..kinds.len())
-            .find(|&i| kinds[i] != RowKind::Child)
-            .unwrap_or(kinds.len())
-    } else {
-        from + 1
-    }
-}
-
-// turns dropping row `from` at insertion point `to` into "move these ids before this id" (None =
-// to the very end), or None when the drop doesn't move anything.
-// `order` is every orderable id in popup order, hidden ones included.
-fn drop_target(
-    rows: &[RowMeta],
-    order: &[String],
-    from: usize,
-    to: usize,
-) -> Option<(Vec<String>, Option<String>)> {
-    let kinds: Vec<RowKind> = rows.iter().map(|r| r.kind).collect();
-    let row = rows.get(from)?;
-    if (from..=block_end(&kinds, from)).contains(&to) {
-        return None;
-    }
-
-    if row.kind == RowKind::Child {
-        let header = (0..from).rev().find(|&i| kinds[i] != RowKind::Child)?;
-        let group_end = block_end(&kinds, header);
-        if to < group_end {
-            return Some((row.ids.clone(), rows.get(to)?.ids.first().cloned()));
-        }
-        // to the end of the group: right after its last profile, which may be a hidden one
-        let last = rows[header].ids.last()?;
-        let successor = order
-            .iter()
-            .position(|id| id == last)
-            .and_then(|i| order.get(i + 1))
-            .cloned();
-        return Some((row.ids.clone(), successor));
-    }
-
-    let before = rows.get(to).and_then(|r| r.ids.first().cloned());
-    Some((row.ids.clone(), before))
-}
+// ------------------------------------------------------------------------------------ Handlers
+// shared by the Slint callbacks (wire) and the native window's events (handle_native_event)
 
 fn send(state: &SharedState, message: MessageToMain) {
     let _ = state.borrow().main_sender.send(message);
+}
+
+fn set_default_browser(state: &SharedState) {
+    send(state, MessageToMain::SetBrowsersAsDefaultBrowser);
+    poll_default_browser(state);
+}
+
+// the default browser switch only happens once the user confirms the OS prompt, so the sidebar
+// card checks back for a while instead of trusting the click
+fn poll_default_browser(state: &SharedState) {
+    let weak_state = std::rc::Rc::downgrade(state);
+    let timer = Timer::default();
+    let mut checks_left = 60;
+    timer.start(TimerMode::Repeated, Duration::from_millis(500), move || {
+        checks_left -= 1;
+        let Some(state) = weak_state.upgrade() else {
+            return;
+        };
+        let is_default = utils::is_default_web_browser();
+        let changed =
+            with_local(|l| std::mem::replace(&mut l.is_default_browser, is_default) != is_default);
+        if changed {
+            refresh(&state);
+        }
+        if is_default {
+            state.borrow_mut().show_set_as_default = false;
+            app::refresh_main_window_model(&state);
+        }
+        if is_default || checks_left <= 0 {
+            with_local(|l| l.default_browser_poll = None);
+        }
+    });
+    with_local(|l| l.default_browser_poll = Some(timer));
+}
+
+// ---- Browsers
+
+fn filter_changed(state: &SharedState, text: &str) {
+    with_local(|l| l.filter = text.to_string());
+    refresh(state);
+}
+
+fn set_show_hidden(state: &SharedState, show: bool) {
+    with_local(|l| l.show_hidden = show);
+    refresh(state);
+}
+
+fn set_group_collapsed(state: &SharedState, app_id: &str, collapsed: bool) {
+    with_local(|l| {
+        if collapsed {
+            l.collapsed.insert(app_id.to_string());
+        } else {
+            l.collapsed.remove(app_id);
+        }
+    });
+    refresh(state);
+}
+
+fn row_meta(list: RowList, row: usize) -> Option<RowMeta> {
+    with_local(|l| match list {
+        RowList::Rows => l.rows.get(row).cloned(),
+        RowList::SpecialRows => l.special_rows.get(row).cloned(),
+    })
+}
+
+// where a row dragged from `from` lands when released at insertion point `raw`
+fn snap_browser_drop(from: usize, raw: usize) -> usize {
+    with_local(|l| {
+        let kinds: Vec<RowKind> = l.rows.iter().map(|r| r.kind).collect();
+        snap_drop_index(&kinds, from, raw)
+    })
 }
 
 fn move_rows(state: &SharedState, from: usize, to: usize) {
@@ -700,33 +539,43 @@ fn toggle_default_profile(state: &SharedState, profile: &str) {
     refresh(state);
 }
 
-fn row_menu_picked(state: &SharedState, row: usize, action: i32) {
+// a "···" menu item of a row of the main list
+fn row_menu_picked(state: &SharedState, row: usize, action: RowAction) {
     let (meta, rows, order) =
         with_local(|l| (l.rows.get(row).cloned(), l.rows.clone(), l.order.clone()));
     let Some(meta) = meta else {
         return;
     };
     match action {
-        0 | 1 if meta.kind == RowKind::Child => {
+        RowAction::MoveToTop | RowAction::MoveToBottom if meta.kind == RowKind::Child => {
             let kinds: Vec<RowKind> = rows.iter().map(|r| r.kind).collect();
             let Some(header) = (0..row).rev().find(|&i| kinds[i] != RowKind::Child) else {
                 return;
             };
-            let target = if action == 0 {
+            let target = if action == RowAction::MoveToTop {
                 header + 1
             } else {
                 block_end(&kinds, header)
             };
             move_rows(state, row, target);
         }
-        0 => {
+        RowAction::MoveToTop => {
             let first = order.first().cloned();
             if first.as_ref() != meta.ids.first() {
                 send(state, MessageToMain::MoveAppProfilesBefore(meta.ids, first));
             }
         }
-        1 => send(state, MessageToMain::MoveAppProfilesBefore(meta.ids, None)),
-        _ => toggle_default_profile(state, &meta.ids[0]),
+        RowAction::MoveToBottom => {
+            send(state, MessageToMain::MoveAppProfilesBefore(meta.ids, None))
+        }
+        RowAction::ToggleDefault => toggle_default_profile(state, &meta.ids[0]),
+    }
+}
+
+// the special rows' menu only has "Open unmatched links here"
+fn special_menu_picked(state: &SharedState, row: usize) {
+    if let Some(meta) = row_meta(RowList::SpecialRows, row) {
+        toggle_default_profile(state, &meta.ids[0]);
     }
 }
 
@@ -757,237 +606,7 @@ fn dismiss_non_browser_banner(state: &SharedState) {
     refresh(state);
 }
 
-// ------------------------------------------------------------------------------------ Rules
-
-// "Work · Chrome" for a profile, just "Safari" for an app without profiles
-fn profile_label(b: &UIBrowser) -> String {
-    if b.supports_profiles {
-        format!("{} · {}", b.profile_name, b.browser_name)
-    } else {
-        b.browser_name.clone()
-    }
-}
-
-// a rule's target as shown in its picker: label, icon, whether it can open privately
-fn target_display(
-    opener: Option<&str>,
-    all: &[&UIBrowser],
-    icons: &mut IconLoader,
-) -> (String, Option<Image>, bool) {
-    let Some(id) = opener else {
-        return ("Show the picker".to_string(), None, false);
-    };
-    match all.iter().find(|b| b.unique_id == id) {
-        Some(b) => {
-            let icon = loaded(icons.load(&b.profile_icon_path))
-                .or_else(|| loaded(icons.load(&b.icon_path)));
-            (profile_label(b), icon, b.supports_incognito)
-        }
-        None => ("Missing app".to_string(), None, false),
-    }
-}
-
-// moves the item at `from` so it ends up at insertion point `to` (0..=len) of the original list
-fn move_item<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
-    if from >= items.len() || to > items.len() || to == from || to == from + 1 {
-        return false;
-    }
-    let item = items.remove(from);
-    let to = if to > from { to - 1 } else { to };
-    items.insert(to, item);
-    true
-}
-
-fn draft_help(draft: &Draft) -> String {
-    let pattern = draft.pattern.trim();
-    if draft.show_invalid && draft.pattern_is_invalid() {
-        return "That isn't a site or link pattern - try notion.so or github.com/acme/**"
-            .to_string();
-    }
-    let what = if let Some(prefix) = pattern.strip_suffix("/**") {
-        format!("Matches every page under {prefix}.")
-    } else if pattern.contains('/') {
-        format!("Matches {pattern} exactly - end it with /** to include the pages below.")
-    } else if !pattern.is_empty() {
-        format!("Matches {pattern} and every page on it.")
-    } else if !draft.source_app.is_empty() {
-        "Matches every link from this app.".to_string()
-    } else {
-        "Matches notion.so and every page on it.".to_string()
-    };
-    format!("{what} Saved once it has a pattern and a target.")
-}
-
-fn refresh_rules(state: &SharedState, win: &SettingsWindow) {
-    let mut st = state.borrow_mut();
-    let mut icons = std::mem::take(&mut st.icons);
-
-    // every profile is a valid target, hidden ones included
-    let all: Vec<&UIBrowser> = st
-        .browsers
-        .iter()
-        .chain(st.restorable_app_profiles.iter())
-        .collect();
-    let hidden_ids: HashSet<&str> = st
-        .restorable_app_profiles
-        .iter()
-        .map(|b| b.unique_id.as_str())
-        .collect();
-    let mut target_ids: Vec<Option<String>> = vec![None];
-    let mut target_options: Vec<SharedString> = vec!["Show the picker".into()];
-    for b in &all {
-        target_ids.push(Some(b.unique_id.clone()));
-        let mut label = profile_label(b);
-        if hidden_ids.contains(b.unique_id.as_str()) {
-            label.push_str(" (hidden)");
-        }
-        target_options.push(label.into());
-    }
-
-    // "any app", then every found app, then other common link senders, then anything only the
-    // saved rules know about
-    let mut sources: Vec<(String, String)> = vec![(String::new(), "Any app".to_string())];
-    let mut add_source = |id: &str, label: &str| {
-        if !id.is_empty() && !sources.iter().any(|(known, _)| known == id) {
-            sources.push((id.to_string(), label.to_string()));
-        }
-    };
-    let mut found: Vec<&UIBrowser> = all.clone();
-    found.sort_by_key(|b| b.browser_name.to_lowercase());
-    for b in found {
-        add_source(&b.bundle_id, &b.browser_name);
-    }
-    for (label, id) in KNOWN_SOURCE_APPS {
-        add_source(id, label);
-    }
-    for rule in &st.ui_settings.rules {
-        add_source(&rule.source_app, &rule.source_app);
-    }
-    let source_label = |id: &str| -> String {
-        sources
-            .iter()
-            .find(|(known, _)| known == id)
-            .map(|(_, label)| label.clone())
-            .unwrap_or_else(|| id.to_string())
-    };
-
-    let rules = st.ui_settings.rules.clone();
-    let rule_rows: Vec<SettingsRuleRow> = rules
-        .iter()
-        .map(|rule| {
-            let opener = rule.opener.as_ref().map(|o| o.profile.as_str());
-            let (label, icon, supports_private) = target_display(opener, &all, &mut icons);
-            SettingsRuleRow {
-                pattern: rule.url_pattern.clone().into(),
-                source_label: if rule.source_app.is_empty() {
-                    SharedString::new()
-                } else {
-                    source_label(&rule.source_app).into()
-                },
-                target_label: label.into(),
-                target_has_icon: icon.is_some(),
-                target_icon: icon.unwrap_or_default(),
-                private: rule.opener.as_ref().is_some_and(|o| o.incognito),
-                supports_private,
-            }
-        })
-        .collect();
-
-    let default_opener = st.ui_settings.default_opener.clone();
-    let (fallback_label, fallback_icon, fallback_supports_private) = target_display(
-        default_opener.as_ref().map(|o| o.profile.as_str()),
-        &all,
-        &mut icons,
-    );
-
-    let (draft, test_url, test_source) = with_local(|l| {
-        if l.test_source >= sources.len() {
-            l.test_source = 0;
-        }
-        (l.draft.clone(), l.test_url.clone(), l.test_source)
-    });
-    let draft_target_label = draft
-        .as_ref()
-        .and_then(|d| d.opener.clone())
-        .map(|opener| target_display(opener.as_deref(), &all, &mut icons).0)
-        .unwrap_or_default();
-
-    // test a link
-    let (result_kind, result_text, matched_rule) = if test_url.trim().is_empty() {
-        (0, String::new(), -1)
-    } else {
-        let source = Some(sources[test_source].0.as_str()).filter(|s| !s.is_empty());
-        match crate::test_opening_rules(&rules, default_opener.is_some(), &test_url, source) {
-            RuleTestOutcome::InvalidUrl => (3, "That isn't a link yet".to_string(), -1),
-            RuleTestOutcome::MatchedRule(i) => {
-                let opener = rules[i].opener.as_ref();
-                let destination = match opener {
-                    None => "shows the picker".to_string(),
-                    Some(o) => {
-                        let label = target_display(Some(&o.profile), &all, &mut icons).0;
-                        let private = if o.incognito { " (private)" } else { "" };
-                        format!("opens in {label}{private}")
-                    }
-                };
-                (1, format!("Rule {} matches → {destination}", i + 1), i as i32)
-            }
-            RuleTestOutcome::DefaultProfile => {
-                let private = if default_opener.as_ref().is_some_and(|o| o.incognito) {
-                    " (private)"
-                } else {
-                    ""
-                };
-                (
-                    2,
-                    format!("No rule matches → opens in {fallback_label}{private}"),
-                    -1,
-                )
-            }
-            RuleTestOutcome::Picker => (2, "No rule matches → shows the picker".to_string(), -1),
-        }
-    };
-
-    st.icons = icons;
-    drop(st);
-
-    let test_source_label = sources[test_source].1.clone();
-    let source_options: Vec<SharedString> = sources.iter().map(|(_, l)| l.into()).collect();
-    with_local(|l| {
-        l.target_ids = target_ids;
-        l.source_ids = sources.iter().map(|(id, _)| id.clone()).collect();
-        l.source_labels = sources.iter().map(|(_, label)| label.clone()).collect();
-    });
-
-    sync_vec_model(&win.get_target_options(), target_options);
-    sync_vec_model(&win.get_source_options(), source_options);
-    sync_vec_model(&win.get_rules(), rule_rows);
-
-    win.set_has_draft(draft.is_some());
-    if let Some(draft) = &draft {
-        win.set_draft_source_label(
-            if draft.source_app.is_empty() {
-                String::new()
-            } else {
-                source_label(&draft.source_app)
-            }
-            .into(),
-        );
-        win.set_draft_target_label(draft_target_label.into());
-        win.set_draft_help(draft_help(draft).into());
-        win.set_draft_pattern_invalid(draft.show_invalid && draft.pattern_is_invalid());
-    }
-
-    win.set_test_source_label(test_source_label.into());
-    win.set_test_result_kind(result_kind);
-    win.set_test_result_text(result_text.into());
-    win.set_matched_rule(matched_rule);
-
-    win.set_fallback_target_label(fallback_label.into());
-    win.set_fallback_target_has_icon(fallback_icon.is_some());
-    win.set_fallback_target_icon(fallback_icon.unwrap_or_default());
-    win.set_fallback_private(default_opener.as_ref().is_some_and(|o| o.incognito));
-    win.set_fallback_supports_private(fallback_supports_private);
-}
+// ---- Rules
 
 fn save_rules(state: &SharedState) {
     let rules = state.borrow().ui_settings.rules.clone();
@@ -995,10 +614,22 @@ fn save_rules(state: &SharedState) {
     refresh(state);
 }
 
-fn edit_rule(state: &SharedState, index: i32, edit: impl FnOnce(&mut UISettingsRule)) {
+// the rule list changes shape: indexes move, so remembered invalid edits would land on the wrong
+// rule
+fn rules_reshaped(state: &SharedState) {
+    with_local(|l| l.rule_pattern_edits.clear());
+    save_rules(state);
+}
+
+fn edit_rule(
+    state: &SharedState,
+    index: usize,
+    edit: impl FnOnce(&mut crate::gui::app_state::UISettingsRule),
+) {
     {
         let mut st = state.borrow_mut();
-        let Some(rule) = st.ui_settings.rules.get_mut(index as usize) else {
+        let Some(rule) = st.ui_settings.rules.get_mut(index) else {
+            tracing::debug!("Ignoring an edit of rule {index}, there's no such rule");
             return;
         };
         edit(rule);
@@ -1006,21 +637,78 @@ fn edit_rule(state: &SharedState, index: i32, edit: impl FnOnce(&mut UISettingsR
     save_rules(state);
 }
 
-fn target_id(index: i32) -> Option<Option<String>> {
-    with_local(|l| l.target_ids.get(index as usize).cloned())
+fn add_rule(state: &SharedState) {
+    with_local(|l| {
+        l.draft.get_or_insert_with(Draft::default);
+    });
+    refresh(state);
 }
 
-fn source_id(index: i32) -> Option<String> {
-    with_local(|l| l.source_ids.get(index as usize).cloned())
+// an invalid pattern stays on screen (in red) but never gets saved.
+// Returns whether it was saved
+fn rule_pattern_edited(state: &SharedState, index: usize, text: &str) -> bool {
+    let pattern = text.trim().to_string();
+    let Some(mut candidate) = state.borrow().ui_settings.rules.get(index).cloned() else {
+        return false;
+    };
+    candidate.url_pattern = pattern.clone();
+    if !candidate.has_valid_matcher() {
+        with_local(|l| l.rule_pattern_edits.insert(index, text.to_string()));
+        refresh(state);
+        return false;
+    }
+    with_local(|l| l.rule_pattern_edits.remove(&index));
+    edit_rule(state, index, |rule| rule.url_pattern = pattern);
+    true
 }
 
-// keeps the private flag when switching to another target that can also open privately
-fn retarget(
-    opener: &Option<UIProfileAndIncognito>,
-    target: Option<String>,
-) -> Option<UIProfileAndIncognito> {
-    let incognito = opener.as_ref().is_some_and(|o| o.incognito);
-    target.map(|profile| UIProfileAndIncognito { profile, incognito })
+fn rule_source_picked(state: &SharedState, index: usize, source_app: String) {
+    edit_rule(state, index, |rule| rule.source_app = source_app);
+}
+
+fn rule_target_picked(state: &SharedState, index: usize, target: Option<String>) {
+    edit_rule(state, index, |rule| rule.opener = retarget(&rule.opener, target));
+}
+
+fn set_rule_private(state: &SharedState, index: usize, private: bool) {
+    edit_rule(state, index, |rule| {
+        if let Some(o) = rule.opener.as_mut() {
+            o.incognito = private;
+        }
+    });
+}
+
+// the copy goes right below
+fn duplicate_rule(state: &SharedState, index: usize) {
+    {
+        let mut st = state.borrow_mut();
+        let rules = &mut st.ui_settings.rules;
+        let Some(copy) = rules.get(index).cloned() else {
+            return;
+        };
+        rules.insert(index + 1, copy);
+    }
+    rules_reshaped(state);
+}
+
+fn delete_rule(state: &SharedState, index: usize) {
+    {
+        let mut st = state.borrow_mut();
+        let rules = &mut st.ui_settings.rules;
+        if index >= rules.len() {
+            return;
+        }
+        rules.remove(index);
+    }
+    rules_reshaped(state);
+}
+
+// `to` is the insertion point in the original list
+fn move_rule(state: &SharedState, from: usize, to: usize) {
+    let moved = move_item(&mut state.borrow_mut().ui_settings.rules, from, to);
+    if moved {
+        rules_reshaped(state);
+    }
 }
 
 // saves the draft as a real rule once it's complete, otherwise just shows its new state
@@ -1036,29 +724,101 @@ fn update_draft(state: &SharedState, edit: impl FnOnce(&mut Draft)) {
     });
     match completed {
         Some(draft) => {
-            if let Some(win) = settings_window(state) {
-                win.set_draft_pattern(SharedString::new());
-            }
+            clear_slint_draft_pattern(state);
             state.borrow_mut().ui_settings.rules.push(draft.as_rule());
-            save_rules(state);
+            rules_reshaped(state);
         }
         None => refresh(state),
     }
 }
 
-// ------------------------------------------------------------------------------------ General
-
-fn refresh_general(state: &SharedState, win: &SettingsWindow) {
-    let settings = state.borrow().ui_settings.clone();
-    win.set_show_hotkeys(settings.visual_settings.show_hotkeys);
-    win.set_quit_on_lost_focus(settings.visual_settings.quit_on_lost_focus);
-    win.set_unwrap_urls(settings.behavioral_settings.unwrap_urls);
-    win.set_run_in_background(settings.behavioral_settings.run_in_background);
-    win.set_native_popup(settings.visual_settings.native_popup);
-    win.set_theme(theme_to_choice(settings.visual_settings.theme));
-    win.global::<StdWidgetPalette>()
-        .set_color_scheme(theme_to_color_scheme(settings.visual_settings.theme));
+// the Slint draft field keeps its own text, the native one clears itself once the draft is gone
+fn clear_slint_draft_pattern(state: &SharedState) {
+    if let Some(win) = settings_window(state) {
+        win.set_draft_pattern(SharedString::new());
+    }
 }
+
+fn draft_pattern_edited(state: &SharedState, text: &str) {
+    update_draft(state, |d| {
+        d.pattern = text.to_string();
+        d.show_invalid = false;
+    });
+}
+
+// from now on an invalid pattern shows as invalid
+fn draft_pattern_committed(state: &SharedState) {
+    if with_local(|l| l.draft.is_some()) {
+        update_draft(state, |d| d.show_invalid = true);
+    }
+}
+
+fn draft_source_picked(state: &SharedState, source_app: String) {
+    update_draft(state, |d| d.source_app = source_app);
+}
+
+fn draft_target_picked(state: &SharedState, target: Option<String>) {
+    update_draft(state, |d| {
+        d.opener = Some(target);
+        d.show_invalid = true;
+    });
+}
+
+fn discard_draft(state: &SharedState) {
+    with_local(|l| l.draft = None);
+    clear_slint_draft_pattern(state);
+    refresh(state);
+}
+
+fn test_url_edited(state: &SharedState, text: &str) {
+    with_local(|l| l.test_url = text.to_string());
+    refresh(state);
+}
+
+// `source` is an index into the source options
+fn test_source_picked(state: &SharedState, source: usize) {
+    with_local(|l| {
+        if source < l.source_ids.len() {
+            l.test_source = source;
+        }
+    });
+    refresh(state);
+}
+
+fn save_default_opener(state: &SharedState, edit: impl FnOnce(&mut Option<UIProfileAndIncognito>)) {
+    let default_opener = {
+        let mut st = state.borrow_mut();
+        let opener = &mut st.ui_settings.default_opener;
+        edit(opener);
+        opener.clone()
+    };
+    send(state, MessageToMain::SaveConfigDefaultOpener(default_opener));
+    refresh(state);
+}
+
+fn fallback_target_picked(state: &SharedState, target: Option<String>) {
+    save_default_opener(state, |opener| *opener = retarget(opener, target));
+}
+
+fn set_fallback_private(state: &SharedState, private: bool) {
+    save_default_opener(state, |opener| {
+        if let Some(o) = opener.as_mut() {
+            o.incognito = private;
+        }
+    });
+}
+
+fn target_id(index: i32) -> Option<Option<String>> {
+    let index = usize::try_from(index).ok()?;
+    with_local(|l| l.target_ids.get(index).cloned())
+}
+
+fn source_id(index: i32) -> Option<String> {
+    let index = usize::try_from(index).ok()?;
+    with_local(|l| l.source_ids.get(index).cloned())
+}
+
+// ---- General
 
 fn save_visual_settings(state: &SharedState) {
     let settings = state.borrow().ui_settings.visual_settings.clone();
@@ -1066,56 +826,214 @@ fn save_visual_settings(state: &SharedState) {
     refresh(state);
 }
 
-// the default browser switch only happens once the user confirms the OS prompt, so the sidebar
-// card checks back for a while instead of trusting the click
-fn poll_default_browser(state: &SharedState) {
-    let weak_state = std::rc::Rc::downgrade(state);
-    let timer = Timer::default();
-    let mut checks_left = 60;
-    timer.start(TimerMode::Repeated, Duration::from_millis(500), move || {
-        checks_left -= 1;
-        let Some(state) = weak_state.upgrade() else {
-            return;
-        };
-        let is_default = utils::is_default_web_browser();
-        if let Some(win) = settings_window(&state) {
-            win.set_is_default_browser(is_default);
-        }
-        if is_default {
-            state.borrow_mut().show_set_as_default = false;
-            app::refresh_main_window_model(&state);
-        }
-        if is_default || checks_left <= 0 {
-            with_local(|l| l.default_browser_poll = None);
-        }
-    });
-    with_local(|l| l.default_browser_poll = Some(timer));
+fn set_theme(state: &SharedState, theme: ConfiguredTheme) {
+    state.borrow_mut().ui_settings.visual_settings.theme = theme;
+    app::apply_theme(state);
+    save_visual_settings(state);
 }
+
+fn set_show_hotkeys(state: &SharedState, value: bool) {
+    state.borrow_mut().ui_settings.visual_settings.show_hotkeys = value;
+    app::refresh_main_window_model(state);
+    save_visual_settings(state);
+}
+
+fn set_quit_on_lost_focus(state: &SharedState, value: bool) {
+    state
+        .borrow_mut()
+        .ui_settings
+        .visual_settings
+        .quit_on_lost_focus = value;
+    save_visual_settings(state);
+}
+
+fn set_unwrap_urls(state: &SharedState, value: bool) {
+    let settings = {
+        let mut st = state.borrow_mut();
+        st.ui_settings.behavioral_settings.unwrap_urls = value;
+        st.ui_settings.behavioral_settings.clone()
+    };
+    send(state, MessageToMain::SaveConfigUIBehavioralSettings(settings));
+    refresh(state);
+}
+
+fn set_run_in_background(state: &SharedState, value: bool) {
+    state
+        .borrow_mut()
+        .ui_settings
+        .behavioral_settings
+        .run_in_background = value;
+    send(state, MessageToMain::SetRunInBackground(value));
+    refresh(state);
+}
+
+fn set_native_popup(state: &SharedState, value: bool) {
+    state.borrow_mut().ui_settings.visual_settings.native_popup = value;
+    // the next link shows the other popup (see app::show_popup_for_url), and the one up now goes
+    // away rather than lingering next to it
+    if state.borrow().popup_visible() {
+        app::hide_popup(state);
+    }
+    save_visual_settings(state);
+}
+
+// ------------------------------------------------------------------------------------ Native
+
+// the row an event names, None (logged) when the list changed since the state it was sent from
+#[cfg(target_os = "macos")]
+fn current_row(list: RowList, row: usize, row_id: &str) -> Option<RowMeta> {
+    let meta = row_meta(list, row).filter(|meta| meta.id == row_id);
+    if meta.is_none() {
+        tracing::info!("Ignoring an event for {list:?} row {row} ({row_id}), the list changed");
+    }
+    meta
+}
+
+// a target_id the native window sent: None when it isn't one of the options last sent,
+// Some(None) for "Show the picker"
+#[cfg(target_os = "macos")]
+fn known_target(target_id: &str) -> Option<Option<String>> {
+    let target = (!target_id.is_empty()).then(|| target_id.to_string());
+    let known = with_local(|l| l.target_ids.contains(&target));
+    if !known {
+        tracing::info!("Ignoring the unknown target {target_id:?}");
+    }
+    known.then_some(target)
+}
+
+// the position of a source_id the native window sent among the options last sent
+#[cfg(target_os = "macos")]
+fn known_source(source_id: &str) -> Option<usize> {
+    let index = with_local(|l| l.source_ids.iter().position(|id| id == source_id));
+    if index.is_none() {
+        tracing::info!("Ignoring the unknown source {source_id:?}");
+    }
+    index
+}
+
+// the native Settings' events (except settings_closed/about_closed, see app), mapped onto the
+// same handlers as the Slint window's callbacks
+#[cfg(target_os = "macos")]
+pub fn handle_native_event(state: &SharedState, event: SettingsEvent) {
+    use SettingsEvent as E;
+    match event {
+        E::SettingsClosed | E::AboutClosed => {}
+        E::SetDefaultBrowser => set_default_browser(state),
+
+        E::BrowsersFilterChanged { text } => filter_changed(state, &text),
+        E::SetShowHidden { show } => set_show_hidden(state, show),
+        E::Rescan => send(state, MessageToMain::Refresh),
+        E::HideNonBrowsers => hide_non_browsers(state),
+        E::DismissNonBrowserBanner => dismiss_non_browser_banner(state),
+        E::ToggleRowVisibility { list, row, row_id } => {
+            if let Some(meta) = current_row(list, row, &row_id) {
+                toggle_visibility(state, &meta);
+            }
+        }
+        E::SetGroupCollapsed { app_id, collapsed } => {
+            set_group_collapsed(state, &app_id, collapsed)
+        }
+        E::RowMenu {
+            list,
+            row,
+            row_id,
+            action,
+        } => {
+            let Some(meta) = current_row(list, row, &row_id) else {
+                return;
+            };
+            // only what the row's menu offered, e.g. no moving while filtering
+            if !settings_model::row_menu(meta.kind, meta.draggable).contains(&action) {
+                tracing::info!("Ignoring {action:?} for row {row_id}, its menu doesn't have it");
+                return;
+            }
+            match list {
+                RowList::Rows => row_menu_picked(state, row, action),
+                RowList::SpecialRows => special_menu_picked(state, row),
+            }
+        }
+        E::MoveBrowserRow { row, row_id, to } => {
+            let Some(meta) = current_row(RowList::Rows, row, &row_id) else {
+                return;
+            };
+            if meta.draggable {
+                move_rows(state, row, snap_browser_drop(row, to));
+            }
+        }
+
+        E::AddRule => add_rule(state),
+        E::RulePatternEdited { index, pattern } => {
+            rule_pattern_edited(state, index, &pattern);
+        }
+        E::RuleSourcePicked { index, source_id } => {
+            if known_source(&source_id).is_some() {
+                rule_source_picked(state, index, source_id);
+            }
+        }
+        E::RuleTargetPicked { index, target_id } => {
+            if let Some(target) = known_target(&target_id) {
+                rule_target_picked(state, index, target);
+            }
+        }
+        E::RulePrivateSet { index, private } => set_rule_private(state, index, private),
+        E::RuleDuplicate { index } => duplicate_rule(state, index),
+        E::RuleDelete { index } => delete_rule(state, index),
+        E::MoveRule { from, to } => move_rule(state, from, to),
+        E::DraftPatternEdited { text } => draft_pattern_edited(state, &text),
+        E::DraftPatternCommitted => draft_pattern_committed(state),
+        E::DraftSourcePicked { source_id } => {
+            if known_source(&source_id).is_some() {
+                draft_source_picked(state, source_id);
+            }
+        }
+        E::DraftTargetPicked { target_id } => {
+            if let Some(target) = known_target(&target_id) {
+                draft_target_picked(state, target);
+            }
+        }
+        E::DraftDiscarded => discard_draft(state),
+        E::TestUrlEdited { text } => test_url_edited(state, &text),
+        E::TestSourcePicked { source_id } => {
+            if let Some(index) = known_source(&source_id) {
+                test_source_picked(state, index);
+            }
+        }
+        E::FallbackTargetPicked { target_id } => {
+            if let Some(target) = known_target(&target_id) {
+                fallback_target_picked(state, target);
+            }
+        }
+        E::FallbackPrivateSet { private } => set_fallback_private(state, private),
+
+        E::SetTheme { theme } => set_theme(state, theme.theme()),
+        E::SetNativePopup { value } => set_native_popup(state, value),
+        E::SetShowHotkeys { value } => set_show_hotkeys(state, value),
+        E::SetQuitOnLostFocus { value } => set_quit_on_lost_focus(state, value),
+        E::SetUnwrapUrls { value } => set_unwrap_urls(state, value),
+        E::SetRunInBackground { value } => set_run_in_background(state, value),
+    }
+}
+
+// ------------------------------------------------------------------------------------ Slint wiring
 
 fn wire(state: &SharedState, win: &SettingsWindow) {
     // ---- sidebar
     {
         let state = state.clone();
-        win.on_set_default_browser(move || {
-            send(&state, MessageToMain::SetBrowsersAsDefaultBrowser);
-            poll_default_browser(&state);
-        });
+        win.on_set_default_browser(move || set_default_browser(&state));
     }
 
     // ---- Browsers
     win.on_refresh(app::forward_handler(state, || MessageToMain::Refresh));
     {
         let state = state.clone();
-        win.on_filter_changed(move |text| {
-            with_local(|l| l.filter = text.to_string());
-            refresh(&state);
-        });
+        win.on_filter_changed(move |text| filter_changed(&state, &text));
     }
     {
         let state = state.clone();
         win.on_show_hidden_toggled(move || {
-            with_local(|l| l.show_hidden = !l.show_hidden);
-            refresh(&state);
+            let show = !with_local(|l| l.show_hidden);
+            set_show_hidden(&state, show);
         });
     }
     {
@@ -1129,7 +1047,10 @@ fn wire(state: &SharedState, win: &SettingsWindow) {
     {
         let state = state.clone();
         win.on_browser_visibility_toggled(move |row| {
-            if let Some(meta) = with_local(|l| l.rows.get(row as usize).cloned()) {
+            if let Some(meta) = usize::try_from(row)
+                .ok()
+                .and_then(|row| row_meta(RowList::Rows, row))
+            {
                 toggle_visibility(&state, &meta);
             }
         });
@@ -1137,7 +1058,10 @@ fn wire(state: &SharedState, win: &SettingsWindow) {
     {
         let state = state.clone();
         win.on_special_visibility_toggled(move |row| {
-            if let Some(meta) = with_local(|l| l.special_rows.get(row as usize).cloned()) {
+            if let Some(meta) = usize::try_from(row)
+                .ok()
+                .and_then(|row| row_meta(RowList::SpecialRows, row))
+            {
                 toggle_visibility(&state, &meta);
             }
         });
@@ -1145,36 +1069,36 @@ fn wire(state: &SharedState, win: &SettingsWindow) {
     {
         let state = state.clone();
         win.on_browser_group_toggled(move |row| {
-            with_local(|l| {
-                if let Some(meta) = l.rows.get(row as usize) {
-                    let app_id = meta.app_id.clone();
-                    if !l.collapsed.remove(&app_id) {
-                        l.collapsed.insert(app_id);
-                    }
-                }
-            });
-            refresh(&state);
+            let Some(meta) = usize::try_from(row)
+                .ok()
+                .and_then(|row| row_meta(RowList::Rows, row))
+            else {
+                return;
+            };
+            let collapsed = with_local(|l| l.collapsed.contains(&meta.app_id));
+            set_group_collapsed(&state, &meta.app_id, !collapsed);
         });
     }
     {
         let state = state.clone();
         win.on_browser_menu_picked(move |row, action| {
-            row_menu_picked(&state, row as usize, action)
+            if let (Ok(row), Some(action)) =
+                (usize::try_from(row), RowAction::from_slint_index(action))
+            {
+                row_menu_picked(&state, row, action);
+            }
         });
     }
     {
         let state = state.clone();
         win.on_special_menu_picked(move |row, _action| {
-            if let Some(meta) = with_local(|l| l.special_rows.get(row as usize).cloned()) {
-                toggle_default_profile(&state, &meta.ids[0]);
+            if let Ok(row) = usize::try_from(row) {
+                special_menu_picked(&state, row);
             }
         });
     }
     win.on_snap_browser_drop(|from, raw| {
-        with_local(|l| {
-            let kinds: Vec<RowKind> = l.rows.iter().map(|r| r.kind).collect();
-            snap_drop_index(&kinds, from.max(0) as usize, raw.max(0) as usize) as i32
-        })
+        snap_browser_drop(from.max(0) as usize, raw.max(0) as usize) as i32
     });
     {
         let state = state.clone();
@@ -1188,116 +1112,80 @@ fn wire(state: &SharedState, win: &SettingsWindow) {
     // ---- Rules
     {
         let state = state.clone();
-        win.on_add_rule(move || {
-            with_local(|l| {
-                l.draft.get_or_insert_with(Draft::default);
-            });
-            refresh(&state);
-        });
+        win.on_add_rule(move || add_rule(&state));
     }
     {
         let state = state.clone();
         win.on_rule_pattern_edited(move |index, text| {
-            let pattern = text.trim().to_string();
-            let mut candidate = match state.borrow().ui_settings.rules.get(index as usize) {
-                Some(rule) => rule.clone(),
-                None => return false,
-            };
-            candidate.url_pattern = pattern.clone();
-            // an invalid pattern stays on screen (in red) but never gets saved
-            if !candidate.has_valid_matcher() {
-                return false;
-            }
-            edit_rule(&state, index, |rule| rule.url_pattern = pattern);
-            true
+            usize::try_from(index).is_ok_and(|index| rule_pattern_edited(&state, index, &text))
         });
     }
     {
         let state = state.clone();
         win.on_rule_source_picked(move |index, source| {
-            if let Some(source_app) = source_id(source) {
-                edit_rule(&state, index, |rule| rule.source_app = source_app);
+            if let (Ok(index), Some(source_app)) = (usize::try_from(index), source_id(source)) {
+                rule_source_picked(&state, index, source_app);
             }
         });
     }
     {
         let state = state.clone();
         win.on_rule_target_picked(move |index, target| {
-            if let Some(target) = target_id(target) {
-                edit_rule(&state, index, |rule| {
-                    rule.opener = retarget(&rule.opener, target)
-                });
+            if let (Ok(index), Some(target)) = (usize::try_from(index), target_id(target)) {
+                rule_target_picked(&state, index, target);
             }
         });
     }
     {
         let state = state.clone();
         win.on_rule_private_toggled(move |index| {
-            edit_rule(&state, index, |rule| {
-                if let Some(o) = rule.opener.as_mut() {
-                    o.incognito = !o.incognito;
-                }
-            });
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            let private = state
+                .borrow()
+                .ui_settings
+                .rules
+                .get(index)
+                .and_then(|rule| rule.opener.as_ref())
+                .map(|o| !o.incognito);
+            if let Some(private) = private {
+                set_rule_private(&state, index, private);
+            }
         });
     }
     {
         let state = state.clone();
         win.on_rule_menu_picked(move |index, action| {
-            {
-                let mut st = state.borrow_mut();
-                let rules = &mut st.ui_settings.rules;
-                let index = index as usize;
-                if index >= rules.len() {
-                    return;
-                }
-                if action == 0 {
-                    let copy = rules[index].clone();
-                    rules.insert(index + 1, copy);
-                } else {
-                    rules.remove(index);
-                }
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            if action == 0 {
+                duplicate_rule(&state, index);
+            } else {
+                delete_rule(&state, index);
             }
-            save_rules(&state);
         });
     }
     {
         let state = state.clone();
         win.on_rules_dropped(move |from, to| {
-            let moved = {
-                let mut st = state.borrow_mut();
-                move_item(
-                    &mut st.ui_settings.rules,
-                    from.max(0) as usize,
-                    to.max(0) as usize,
-                )
-            };
-            if moved {
-                save_rules(&state);
-            }
+            move_rule(&state, from.max(0) as usize, to.max(0) as usize);
         });
     }
     {
         let state = state.clone();
-        win.on_draft_pattern_edited(move |text| {
-            update_draft(&state, |d| {
-                d.pattern = text.to_string();
-                d.show_invalid = false;
-            });
-        });
+        win.on_draft_pattern_edited(move |text| draft_pattern_edited(&state, &text));
     }
     {
         let state = state.clone();
-        win.on_draft_pattern_committed(move || {
-            if with_local(|l| l.draft.is_some()) {
-                update_draft(&state, |d| d.show_invalid = true);
-            }
-        });
+        win.on_draft_pattern_committed(move || draft_pattern_committed(&state));
     }
     {
         let state = state.clone();
         win.on_draft_source_picked(move |source| {
             if let Some(source_app) = source_id(source) {
-                update_draft(&state, |d| d.source_app = source_app);
+                draft_source_picked(&state, source_app);
             }
         });
     }
@@ -1305,317 +1193,70 @@ fn wire(state: &SharedState, win: &SettingsWindow) {
         let state = state.clone();
         win.on_draft_target_picked(move |target| {
             if let Some(target) = target_id(target) {
-                update_draft(&state, |d| {
-                    d.opener = Some(target);
-                    d.show_invalid = true;
-                });
+                draft_target_picked(&state, target);
             }
         });
     }
     {
         let state = state.clone();
-        let weak_win = win.as_weak();
-        win.on_draft_discarded(move || {
-            with_local(|l| l.draft = None);
-            if let Some(win) = weak_win.upgrade() {
-                win.set_draft_pattern(SharedString::new());
-            }
-            refresh(&state);
-        });
+        win.on_draft_discarded(move || discard_draft(&state));
     }
     {
         let state = state.clone();
-        win.on_test_url_edited(move |text| {
-            with_local(|l| l.test_url = text.to_string());
-            refresh(&state);
-        });
+        win.on_test_url_edited(move |text| test_url_edited(&state, &text));
     }
     {
         let state = state.clone();
         win.on_test_source_picked(move |source| {
-            with_local(|l| {
-                if (source as usize) < l.source_ids.len() {
-                    l.test_source = source as usize;
-                }
-            });
-            refresh(&state);
+            if let Ok(source) = usize::try_from(source) {
+                test_source_picked(&state, source);
+            }
         });
     }
     {
         let state = state.clone();
         win.on_fallback_target_picked(move |target| {
-            let Some(target) = target_id(target) else {
-                return;
-            };
-            let default_opener = {
-                let mut st = state.borrow_mut();
-                let opener = &mut st.ui_settings.default_opener;
-                *opener = retarget(opener, target);
-                opener.clone()
-            };
-            send(&state, MessageToMain::SaveConfigDefaultOpener(default_opener));
-            refresh(&state);
+            if let Some(target) = target_id(target) {
+                fallback_target_picked(&state, target);
+            }
         });
     }
     {
         let state = state.clone();
         win.on_fallback_private_toggled(move || {
-            let default_opener = {
-                let mut st = state.borrow_mut();
-                if let Some(o) = st.ui_settings.default_opener.as_mut() {
-                    o.incognito = !o.incognito;
-                }
-                st.ui_settings.default_opener.clone()
-            };
-            send(&state, MessageToMain::SaveConfigDefaultOpener(default_opener));
-            refresh(&state);
+            let private = state
+                .borrow()
+                .ui_settings
+                .default_opener
+                .as_ref()
+                .is_some_and(|o| !o.incognito);
+            set_fallback_private(&state, private);
         });
     }
 
     // ---- General
     {
         let state = state.clone();
-        win.on_theme_changed(move |choice| {
-            state.borrow_mut().ui_settings.visual_settings.theme = choice_to_theme(choice);
-            app::apply_theme(&state);
-            save_visual_settings(&state);
-        });
+        win.on_theme_changed(move |choice| set_theme(&state, choice_to_theme(choice)));
     }
     {
         let state = state.clone();
-        win.on_show_hotkeys_changed(move |v| {
-            state.borrow_mut().ui_settings.visual_settings.show_hotkeys = v;
-            app::refresh_main_window_model(&state);
-            save_visual_settings(&state);
-        });
+        win.on_show_hotkeys_changed(move |v| set_show_hotkeys(&state, v));
     }
     {
         let state = state.clone();
-        win.on_quit_on_lost_focus_changed(move |v| {
-            state
-                .borrow_mut()
-                .ui_settings
-                .visual_settings
-                .quit_on_lost_focus = v;
-            save_visual_settings(&state);
-        });
+        win.on_quit_on_lost_focus_changed(move |v| set_quit_on_lost_focus(&state, v));
     }
     {
         let state = state.clone();
-        win.on_unwrap_urls_changed(move |v| {
-            state
-                .borrow_mut()
-                .ui_settings
-                .behavioral_settings
-                .unwrap_urls = v;
-            let settings = state.borrow().ui_settings.behavioral_settings.clone();
-            send(&state, MessageToMain::SaveConfigUIBehavioralSettings(settings));
-            refresh(&state);
-        });
+        win.on_unwrap_urls_changed(move |v| set_unwrap_urls(&state, v));
     }
     {
         let state = state.clone();
-        win.on_run_in_background_changed(move |v| {
-            state
-                .borrow_mut()
-                .ui_settings
-                .behavioral_settings
-                .run_in_background = v;
-            send(&state, MessageToMain::SetRunInBackground(v));
-            refresh(&state);
-        });
+        win.on_run_in_background_changed(move |v| set_run_in_background(&state, v));
     }
     {
         let state = state.clone();
-        win.on_native_popup_changed(move |v| {
-            state.borrow_mut().ui_settings.visual_settings.native_popup = v;
-            // the next link shows the other popup (see app::show_popup_for_url), and the one up
-            // now goes away rather than lingering next to it
-            if state.borrow().popup_visible() {
-                app::hide_popup(&state);
-            }
-            save_visual_settings(&state);
-        });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use RowKind::{Child, Header, Single};
-
-    fn meta(kind: RowKind, ids: &[&str]) -> RowMeta {
-        RowMeta {
-            kind,
-            ids: ids.iter().map(|s| s.to_string()).collect(),
-            app_id: ids[0].split('#').next().unwrap().to_string(),
-            hidden: false,
-        }
-    }
-
-    fn ids(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
-    }
-
-    // safari | chrome: work, home, (hidden school) | firefox
-    fn rows() -> (Vec<RowMeta>, Vec<String>) {
-        let rows = vec![
-            meta(Single, &["safari"]),
-            meta(Header, &["chrome#work", "chrome#home", "chrome#school"]),
-            meta(Child, &["chrome#work"]),
-            meta(Child, &["chrome#home"]),
-            meta(Single, &["firefox"]),
-        ];
-        let order = ids(&[
-            "safari",
-            "chrome#work",
-            "chrome#home",
-            "chrome#school",
-            "firefox",
-        ]);
-        (rows, order)
-    }
-
-    #[test]
-    fn snap_keeps_a_profile_inside_its_group() {
-        let kinds = [Single, Header, Child, Child, Single];
-        assert_eq!(snap_drop_index(&kinds, 3, 0), 2);
-        assert_eq!(snap_drop_index(&kinds, 3, 2), 2);
-        assert_eq!(snap_drop_index(&kinds, 2, 5), 4);
-    }
-
-    #[test]
-    fn snap_keeps_apps_out_of_other_groups() {
-        let kinds = [Single, Header, Child, Child, Single];
-        // between chrome's profiles snaps to the nearest group edge
-        assert_eq!(snap_drop_index(&kinds, 4, 2), 1);
-        assert_eq!(snap_drop_index(&kinds, 0, 3), 4);
-        assert_eq!(snap_drop_index(&kinds, 0, 5), 5);
-        assert_eq!(snap_drop_index(&kinds, 0, 99), 5);
-    }
-
-    #[test]
-    fn dropping_a_group_moves_all_its_profiles() {
-        let (rows, order) = rows();
-        let target = drop_target(&rows, &order, 1, 0);
-        assert_eq!(
-            target,
-            Some((
-                ids(&["chrome#work", "chrome#home", "chrome#school"]),
-                Some("safari".to_string())
-            ))
-        );
-    }
-
-    #[test]
-    fn dropping_a_row_next_to_itself_does_nothing() {
-        let (rows, order) = rows();
-        assert_eq!(drop_target(&rows, &order, 0, 0), None);
-        assert_eq!(drop_target(&rows, &order, 0, 1), None);
-        // a group's block ends after its last shown profile
-        assert_eq!(drop_target(&rows, &order, 1, 4), None);
-        assert_eq!(drop_target(&rows, &order, 2, 3), None);
-    }
-
-    #[test]
-    fn dropping_at_the_end_moves_to_the_very_end() {
-        let (rows, order) = rows();
-        assert_eq!(drop_target(&rows, &order, 0, 5), Some((ids(&["safari"]), None)));
-    }
-
-    #[test]
-    fn dropping_a_profile_at_its_group_end_goes_after_hidden_ones() {
-        let (rows, order) = rows();
-        assert_eq!(
-            drop_target(&rows, &order, 2, 4),
-            Some((ids(&["chrome#work"]), Some("firefox".to_string())))
-        );
-        assert_eq!(
-            drop_target(&rows, &order, 3, 2),
-            Some((ids(&["chrome#home"]), Some("chrome#work".to_string())))
-        );
-    }
-
-    #[test]
-    fn move_item_reorders_rules() {
-        let mut items = vec!["a", "b", "c", "d"];
-        assert!(move_item(&mut items, 0, 3));
-        assert_eq!(items, vec!["b", "c", "a", "d"]);
-        assert!(move_item(&mut items, 3, 0));
-        assert_eq!(items, vec!["d", "b", "c", "a"]);
-        assert!(move_item(&mut items, 1, 4));
-        assert_eq!(items, vec!["d", "c", "a", "b"]);
-    }
-
-    #[test]
-    fn move_item_next_to_itself_is_a_no_op() {
-        let mut items = vec!["a", "b", "c"];
-        assert!(!move_item(&mut items, 1, 1));
-        assert!(!move_item(&mut items, 1, 2));
-        assert!(!move_item(&mut items, 5, 0));
-        assert_eq!(items, vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn draft_needs_a_valid_pattern_and_a_target() {
-        let mut draft = Draft::default();
-        assert!(!draft.is_complete());
-        draft.pattern = "notion.so".to_string();
-        assert!(!draft.is_complete());
-        // "Show the picker" counts as a target
-        draft.opener = Some(None);
-        assert!(draft.is_complete());
-        draft.pattern = "notion.so/[".to_string();
-        assert!(!draft.is_complete());
-        assert!(draft.pattern_is_invalid());
-    }
-
-    #[test]
-    fn draft_with_only_a_source_app_is_complete_once_targeted() {
-        let draft = Draft {
-            source_app: "com.apple.mail".to_string(),
-            opener: Some(Some("chrome#work".to_string())),
-            ..Default::default()
-        };
-        assert!(draft.is_complete());
-        assert_eq!(draft.as_rule().opener.unwrap().profile, "chrome#work");
-    }
-
-    #[test]
-    fn draft_help_describes_what_the_pattern_matches() {
-        let help = |pattern: &str| {
-            let draft = Draft {
-                pattern: pattern.to_string(),
-                ..Default::default()
-            };
-            draft_help(&draft)
-        };
-        assert!(help("notion.so").starts_with("Matches notion.so and every page on it."));
-        assert!(
-            help("github.com/acme/**").starts_with("Matches every page under github.com/acme.")
-        );
-        assert!(help("github.com/acme").starts_with("Matches github.com/acme exactly"));
-    }
-
-    #[test]
-    fn relative_time_reads_naturally() {
-        assert_eq!(relative_time(Duration::from_secs(5)), "just now");
-        assert_eq!(relative_time(Duration::from_secs(120)), "2 min ago");
-        assert_eq!(relative_time(Duration::from_secs(3600)), "1 hour ago");
-        assert_eq!(relative_time(Duration::from_secs(3 * 86400)), "3 days ago");
-    }
-
-    #[test]
-    fn join_names_lists_apps() {
-        assert_eq!(join_names(&ids(&["Slack"])), "Slack");
-        assert_eq!(join_names(&ids(&["Slack", "Zoom"])), "Slack and Zoom");
-        assert_eq!(
-            join_names(&ids(&["Slack", "Zoom", "Figma"])),
-            "Slack, Zoom and Figma"
-        );
-        assert_eq!(
-            join_names(&ids(&["Slack", "Zoom", "Figma", "Linear", "Notion"])),
-            "Slack, Zoom, Figma and 2 more"
-        );
+        win.on_native_popup_changed(move |v| set_native_popup(&state, v));
     }
 }

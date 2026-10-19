@@ -2,3 +2,4 @@ pub mod mac_paths;
 pub mod macos_native;
 pub mod macos_utils;
 pub mod native_popup;
+pub mod native_settings;

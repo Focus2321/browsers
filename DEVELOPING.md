@@ -53,6 +53,12 @@ setting off, with `SLINT_BACKEND=headless` (the MCP test mode in CLAUDE.md), or 
 
     BROWSERS_POPUP=slint cargo run -- https://example.com
 
+Settings and About are native windows too on macOS 13+ (`SETTINGS_CONTRACT.md` and
+`src/macos/native_settings.rs`), whatever the "Native popup" setting says.
+Both versions show the same model from `src/gui/settings_model.rs` and call the same handlers in
+`src/gui/settings_window.rs`, so a change there reaches both.
+`BROWSERS_UI=slint` forces the Slint popup, Settings and About (`BROWSERS_POPUP=slint` does too).
+
 ## Remotes
 
 - `origin` - your fork (Focus2321/browsers)

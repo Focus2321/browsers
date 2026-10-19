@@ -14,6 +14,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Rules page: "Test a link", drag to reorder rules, new rules stay drafts until complete, hidden profiles can be rule targets
 - macOS: "Keep running in the background" (on by default) shows the picker instantly for every link after the first
 - macOS 13+: a native (SwiftUI) link picker, on by default, switchable with Settings → General → "Native popup"
+- macOS 13+: Settings and About are now native macOS windows
 
 ### Fixed
 
