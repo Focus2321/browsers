@@ -1,421 +1,1966 @@
-import { LineEdit, Switch, ScrollView, Palette, ComboBox, Button, RadioGroup } from "std-widgets.slint";
-import { Card, DirEntry, DirectoriesList, ThemeChoice } from "common.slint";
-import { BrowserItem, RestorableProfile } from "main_window.slint";
+import { ScrollView, Palette, AboutSlint } from "std-widgets.slint";
+import { DirEntry, DirectoriesList, ThemeChoice } from "common.slint";
 
-export enum SettingsTab { general, appearance, rules, advanced }
-
-export struct SettingsRule {
-    index: int, // -1 means "default opener" row
-    url-pattern: string,
-    opener-id: string,
-    opener-label: string,
-    // index into profile-picker-options / (offset by one) browsers: 0 is the synthetic "List of
-    // Apps" entry, N+1 is browsers[N]. Rust computes this alongside opener-label so ProfilePicker
-    // can drive the ComboBox by position instead of matching on opener-label's text.
-    opener-index: int,
-    incognito: bool,
-    show-incognito: bool,
+// one row of the Browsers page list.
+// Rows come pre-flattened from Rust (see settings_window.rs -> build_browser_rows): an app with
+// several profiles is a header row followed by one indented row per profile.
+export struct SettingsBrowserRow {
+    // 0 = app without profiles, 1 = header of an app with profiles, 2 = profile under a header
+    kind: int,
+    name: string,
+    detail: string,
+    icon: image,
+    has-icon: bool,
+    // shown in a colored circle when a profile has no picture of its own
+    letter: string,
+    letter-color: color,
+    hidden: bool,
+    is-default: bool,
+    collapsed: bool,
+    draggable: bool,
 }
 
-component ProfilePicker inherits HorizontalLayout {
-    in property <[BrowserItem]> browsers;
-    // "List of Apps" followed by one entry per browser, same order as browsers - shared across
-    // every row's ComboBox since the choices themselves don't vary per rule, only the selection.
-    in property <[string]> profile-picker-options;
-    in property <SettingsRule> rule;
-    spacing: 6px;
-    // without this, the default stretch alignment redistributes space between the ComboBox and
-    // the incognito checkbox below whenever the checkbox appears/disappears (depends on which
-    // browser is picked), which shifts the dropdown sideways.
-    // start just packs everything to its natural size instead, so the dropdown stays put either
-    // way
-    alignment: start;
+// one saved rule on the Rules page
+export struct SettingsRuleRow {
+    pattern: string,
+    // empty = any app
+    source-label: string,
+    target-label: string,
+    target-icon: image,
+    target-has-icon: bool,
+    private: bool,
+    supports-private: bool,
+}
 
-    callback profile-changed(string);
-    callback incognito-changed(bool);
+// light/dark colors of this window, following Palette.color-scheme (which Rust forces to the
+// chosen theme, see settings_window.rs -> theme_to_color_scheme)
+global SC {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    out property <color> window: dark ? #1f1f22 : #ffffff;
+    out property <color> sidebar: dark ? #28282c : #f4f4f6;
+    out property <color> text: dark ? #ececef : #1d1d1f;
+    out property <color> secondary: dark ? #a1a1a8 : #6e6e73;
+    out property <color> tertiary: dark ? #6f6f76 : #a8a8ae;
+    out property <color> border: dark ? #3a3a3f : #e3e3e8;
+    out property <color> separator: dark ? #2f2f34 : #ededf1;
+    out property <color> field: dark ? #2c2c30 : #f2f2f5;
+    out property <color> card: dark ? #26262a : #fafafb;
+    out property <color> raised: dark ? #2d2d32 : #ffffff;
+    out property <color> hover: dark ? #2b2b30 : #f5f5f8;
+    out property <color> accent: dark ? #4f7fff : #2457d6;
+    out property <color> accent-hover: dark ? #6a92ff : #1d48b8;
+    out property <color> accent-text: dark ? #8eaeff : #2457d6;
+    out property <color> accent-soft: dark ? #4f7fff.with-alpha(0.16) : #2457d6.with-alpha(0.07);
+    out property <color> accent-border: dark ? #4f7fff.with-alpha(0.45) : #2457d6.with-alpha(0.3);
+    out property <color> track: dark ? #48484e : #d5d5da;
+    out property <color> danger: dark ? #ff6b62 : #d93a30;
+    out property <color> success: #30b350;
+    out property <color> warning: #e8a317;
+    out property <color> chip: dark ? #34343a : #f0f0f3;
+    // where a dragged row came from
+    out property <color> slot: dark ? #4f7fff.with-alpha(0.06) : #2457d6.with-alpha(0.035);
+    out property <color> private-bg: dark ? #ececef : #2c2c30;
+    out property <color> private-text: dark ? #1d1d1f : #ffffff;
+    out property <length> row-height: 42px;
+    out property <length> rule-pitch: 50px;
+}
 
-    Text {
-        text: rule.opener-id == "" ? "Show" : "Open in";
-        font-size: 12px;
+// 16x16 line icon drawn from SVG path commands
+component Icon inherits Path {
+    in property <color> color: SC.secondary;
+    width: 16px;
+    height: 16px;
+    viewbox-width: 16;
+    viewbox-height: 16;
+    stroke: root.color;
+    stroke-width: 1.4px;
+    fill: transparent;
+}
+
+// rectangle with a dashed 1px outline - Slint borders can't be dashed
+component DashedBox inherits Rectangle {
+    in property <color> dash-color: SC.border;
+    property <length> step: 9px;
+    property <int> nx: Math.max(1, (self.width - 4px) / step);
+    property <int> ny: Math.max(1, (self.height - 4px) / step);
+    for i in root.nx: Rectangle {
+        x: 2px + i * root.step;
+        y: 0;
+        width: 5px;
+        height: 1px;
+        background: root.dash-color;
+    }
+    for i in root.nx: Rectangle {
+        x: 2px + i * root.step;
+        y: root.height - 1px;
+        width: 5px;
+        height: 1px;
+        background: root.dash-color;
+    }
+    for i in root.ny: Rectangle {
+        x: 0;
+        y: 2px + i * root.step;
+        width: 1px;
+        height: 5px;
+        background: root.dash-color;
+    }
+    for i in root.ny: Rectangle {
+        x: root.width - 1px;
+        y: 2px + i * root.step;
+        width: 1px;
+        height: 5px;
+        background: root.dash-color;
+    }
+}
+
+// the ⋮⋮ grip of a draggable row
+component DragHandle inherits Rectangle {
+    in property <color> dot-color: SC.tertiary;
+    width: 10px;
+    height: 14px;
+    for i in 6: Rectangle {
+        x: Math.mod(i, 2) * 5px + 1px;
+        y: Math.floor(i / 2) * 5px + 2px;
+        width: 2.5px;
+        height: 2.5px;
+        border-radius: 1.25px;
+        background: root.dot-color;
+    }
+}
+
+component PillButton inherits Rectangle {
+    in property <string> text;
+    in property <string> badge;
+    in property <string> icon-commands;
+    in property <bool> primary;
+    in property <bool> active;
+    in property <bool> link;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    width: self.preferred-width;
+    height: 26px;
+    border-radius: 6px;
+    opacity: root.enabled ? 1 : 0.45;
+    background: root.link ? transparent
+        : root.primary ? (ta.has-hover && root.enabled ? SC.accent-hover : SC.accent)
+        : root.active ? SC.accent-soft
+        : ta.has-hover && root.enabled ? SC.hover : SC.raised;
+    border-width: root.primary || root.link ? 0 : 1px;
+    border-color: root.active ? SC.accent-border : SC.border;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+
+    HorizontalLayout {
+        padding-left: root.link ? 2px : 10px;
+        padding-right: root.link ? 2px : 10px;
+        spacing: 5px;
+        alignment: center;
+        if root.icon-commands != "": Icon {
+            y: (parent.height - self.height) / 2;
+            width: 13px;
+            height: 13px;
+            commands: root.icon-commands;
+            color: root.primary ? white : root.link || root.active ? SC.accent-text : SC.text;
+        }
+        Text {
+            text: root.text;
+            font-size: 12px;
+            font-weight: root.primary ? 600 : 400;
+            vertical-alignment: center;
+            color: root.primary ? white : root.link || root.active ? SC.accent-text : SC.text;
+        }
+        if root.badge != "": Text {
+            text: root.badge;
+            font-size: 11px;
+            vertical-alignment: center;
+            color: root.active ? SC.accent-text : SC.secondary;
+        }
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Toggle inherits Rectangle {
+    in property <bool> checked;
+    in property <string> label;
+    callback toggled(bool);
+
+    width: 34px;
+    height: 20px;
+    border-radius: 10px;
+    background: root.checked ? SC.accent : SC.track;
+    accessible-role: switch;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-label: root.label;
+    accessible-action-default => { root.toggled(!root.checked); }
+    animate background { duration: 120ms; }
+
+    Rectangle {
+        x: root.checked ? parent.width - self.width - 2px : 2px;
+        y: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: white;
+        drop-shadow-blur: 2px;
+        drop-shadow-color: #00000033;
+        drop-shadow-offset-y: 1px;
+        animate x { duration: 120ms; }
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(!root.checked); }
+    }
+}
+
+component Field inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text <=> ti.text;
+    in property <bool> mono;
+    in property <bool> invalid;
+    in property <string> icon-commands;
+    out property <bool> has-focus: ti.has-focus;
+    callback edited(string);
+    callback accepted(string);
+    callback focus-lost();
+
+    public function focus-input() {
+        ti.focus();
+    }
+
+    height: 28px;
+    border-radius: 6px;
+    background: SC.field;
+    border-width: 1px;
+    border-color: root.invalid ? SC.danger : ti.has-focus ? SC.accent : SC.field;
+
+    property <length> text-x: root.icon-commands != "" ? 26px : 9px;
+
+    if root.icon-commands != "": Icon {
+        x: 8px;
+        y: (parent.height - self.height) / 2;
+        width: 12px;
+        height: 12px;
+        commands: root.icon-commands;
+        color: SC.tertiary;
+    }
+
+    if ti.text == "": Text {
+        x: root.text-x;
+        width: parent.width - root.text-x - 8px;
+        height: parent.height;
         vertical-alignment: center;
+        text: root.placeholder;
+        font-size: 12px;
+        color: SC.tertiary;
+        overflow: elide;
     }
 
-    picker := ComboBox {
-        width: 220px;
-        model: root.profile-picker-options;
-        current-index: root.rule.opener-index;
-        selected(value) => {
-            // by position, not by matching value against a browser's name - two profiles could
-            // share a display name, and the model/browsers arrays are built in lockstep anyway
-            root.profile-changed(self.current-index == 0 ? "" : root.browsers[self.current-index - 1].unique-id);
-        }
-    }
-
-    if rule.show-incognito: TouchArea {
-        clicked => { root.incognito-changed(!rule.incognito); }
-        HorizontalLayout {
-            spacing: 4px;
-            Rectangle {
-                width: 12px;
-                height: 12px;
-                border-width: 1px;
-                border-color: Palette.border;
-                background: rule.incognito ? Palette.accent-background : transparent;
-            }
-            Text {
-                text: "In Incognito";
-                font-size: 12px;
+    ti := TextInput {
+        x: root.text-x;
+        width: parent.width - root.text-x - 8px;
+        height: parent.height;
+        vertical-alignment: center;
+        single-line: true;
+        font-size: 12px;
+        font-family: root.mono ? "Menlo" : "";
+        color: SC.text;
+        selection-background-color: SC.accent.with-alpha(0.3);
+        selection-foreground-color: SC.text;
+        accessible-label: root.placeholder;
+        edited => { root.edited(self.text); }
+        accepted => { root.accepted(self.text); }
+        changed has-focus => {
+            if (!self.has-focus) {
+                root.focus-lost();
             }
         }
     }
 }
 
-component GeneralTab inherits VerticalLayout {
-    in property <bool> show-hotkeys;
-    in property <bool> quit-on-lost-focus;
-    in property <bool> show-quit-on-lost-focus;
-    in property <bool> unwrap-urls;
-    in property <[RestorableProfile]> restorable-app-profiles;
+// a button that opens a menu of `options` right below itself
+component Picker inherits Rectangle {
+    in property <string> label;
+    in property <[string]> options;
+    in property <image> icon;
+    in property <bool> has-icon;
+    in property <bool> placeholder;
+    in property <bool> invalid;
+    in property <bool> chip;
+    callback picked(int);
 
-    callback show-hotkeys-changed(bool);
-    callback quit-on-lost-focus-changed(bool);
-    callback unwrap-urls-changed(bool);
-    callback restore-profile(string);
-
-    alignment: start;
-    spacing: 10px;
-
-    HorizontalLayout {
-        Text { text: "Show hotkeys"; font-size: 13px; vertical-alignment: center; }
-        Rectangle { horizontal-stretch: 1; }
-        Switch { checked: root.show-hotkeys; toggled => { root.show-hotkeys-changed(self.checked); } }
-    }
-
-    if show-quit-on-lost-focus: HorizontalLayout {
-        Text { text: "Quit when focus is lost"; font-size: 13px; vertical-alignment: center; }
-        Rectangle { horizontal-stretch: 1; }
-        Switch { checked: root.quit-on-lost-focus; toggled => { root.quit-on-lost-focus-changed(self.checked); } }
-    }
+    height: root.chip ? 22px : 28px;
+    border-radius: root.chip ? 5px : 6px;
+    background: root.chip ? (ta.has-hover ? SC.border : SC.chip) : ta.has-hover ? SC.hover : SC.raised;
+    border-width: root.chip ? 0 : 1px;
+    border-color: root.invalid ? SC.danger : SC.border;
+    accessible-role: combobox;
+    accessible-label: root.label;
+    accessible-action-default => { cma.show({ x: 0, y: self.height + 2px }); }
 
     HorizontalLayout {
-        Text { text: "Unwrap URLs"; font-size: 13px; vertical-alignment: center; }
-        Rectangle { horizontal-stretch: 1; }
-        Switch { checked: root.unwrap-urls; toggled => { root.unwrap-urls-changed(self.checked); } }
+        padding-left: root.chip ? 7px : 9px;
+        padding-right: 7px;
+        spacing: 6px;
+        if root.has-icon: Image {
+            y: (parent.height - self.height) / 2;
+            width: 15px;
+            height: 15px;
+            source: root.icon;
+            image-fit: contain;
+        }
+        Text {
+            text: root.label;
+            font-size: 12px;
+            vertical-alignment: center;
+            overflow: elide;
+            color: root.placeholder ? SC.tertiary : SC.text;
+            horizontal-stretch: 1;
+        }
+        if !root.chip: Icon {
+            y: (parent.height - self.height) / 2;
+            width: 10px;
+            height: 10px;
+            commands: "M4 6 L8 10 L12 6";
+            color: SC.tertiary;
+        }
     }
 
-    Text { text: "Applications and Profiles"; font-size: 13px; }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { cma.show({ x: 0, y: self.height + 2px }); }
+    }
 
-    // explicit width/height here (matches the Button below) - ContextMenuArea doesn't forward its
-    // visual content's size to the layout it sits in, so without this the enclosing
-    // VerticalLayout reserved zero height for this row and the "Restore App..." button (still
-    // rendered at 130x26) just overlapped the hint text below it instead of pushing it down
-    ram := ContextMenuArea {
-        width: 130px;
-        height: 26px;
+    cma := ContextMenuArea {
+        width: 0;
+        height: 0;
+        enabled: false;
         Menu {
-            if root.restorable-app-profiles.length == 0: MenuItem { title: "No hidden apps or profiles"; enabled: false; }
-            for p[i] in root.restorable-app-profiles: MenuItem {
-                title: p.full-name;
-                activated => { root.restore-profile(p.unique-id); }
-            }
-        }
-
-        Button {
-            width: 130px;
-            height: 26px;
-            text: "Restore App...";
-            // Button doesn't expose a mouse-x/mouse-y like TouchArea does, so just anchor the
-            // menu under the button's bottom-left corner instead of the click position
-            clicked => { ram.show({x: 0px, y: self.height}); }
-        }
-    }
-
-    Text {
-        text: "To hide and move applications/profiles just right-click on the application in the main dialog";
-        font-size: 11px;
-        color: Palette.foreground.transparentize(0.4);
-        wrap: word-wrap;
-    }
-}
-
-component AppearanceTab inherits VerticalLayout {
-    in property <ThemeChoice> theme;
-
-    callback theme-changed(ThemeChoice);
-
-    alignment: start;
-    spacing: 12px;
-
-    RadioGroup {
-        title: "Theme";
-        RadioButton { text: "Match System"; checked: root.theme == ThemeChoice.auto; }
-        RadioButton { text: "Light"; checked: root.theme == ThemeChoice.light; }
-        RadioButton { text: "Dark"; checked: root.theme == ThemeChoice.dark; }
-        // matching on the picked label rather than a two-way `checked` binding per button - Rust
-        // re-echoes root.theme right back after every change anyway (see save_and_refresh in
-        // settings_window.rs), so the one-way `checked:` bindings above staying in sync is enough
-        selected(value) => {
-            if (value == "Match System") {
-                root.theme-changed(ThemeChoice.auto);
-            } else if (value == "Light") {
-                root.theme-changed(ThemeChoice.light);
-            } else {
-                root.theme-changed(ThemeChoice.dark);
+            for option[i] in root.options: MenuItem {
+                title: option;
+                activated => { root.picked(i); }
             }
         }
     }
 }
 
-component RuleCard inherits Card {
-    in property <SettingsRule> rule;
-    in property <[BrowserItem]> browsers;
-    in property <[string]> profile-picker-options;
-    callback url-changed(int, string);
-    callback profile-changed(int, string);
-    callback incognito-changed(int, bool);
-    callback remove(int);
+// the ··· button at the end of a row
+component MoreButton inherits Rectangle {
+    in property <[string]> options;
+    callback picked(int);
 
-    HorizontalLayout {
-        padding: 10px;
-        spacing: 10px;
+    width: 24px;
+    height: 24px;
+    border-radius: 5px;
+    background: ta.has-hover ? SC.hover : transparent;
+    accessible-role: button;
+    accessible-label: "More";
+    accessible-action-default => { cma.show({ x: 0, y: self.height }); }
 
-        VerticalLayout {
-            spacing: 6px;
-            HorizontalLayout {
-                spacing: 6px;
-                Text { text: "If URL matches"; font-size: 12px; vertical-alignment: center; }
-                LineEdit {
-                    width: 300px;
-                    text: rule.url-pattern;
-                    placeholder-text: "https://";
-                    edited(t) => { root.url-changed(rule.index, t); }
+    for i in 3: Rectangle {
+        x: 6px + i * 5px;
+        y: 11px;
+        width: 2.5px;
+        height: 2.5px;
+        border-radius: 1.25px;
+        background: SC.secondary;
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { cma.show({ x: 0, y: self.height }); }
+    }
+
+    cma := ContextMenuArea {
+        width: 0;
+        height: 0;
+        enabled: false;
+        Menu {
+            for option[i] in root.options: MenuItem {
+                title: option;
+                activated => { root.picked(i); }
+            }
+        }
+    }
+}
+
+// the ··· button of a rule, with a submenu to limit it to links from one app
+component RuleMoreButton inherits Rectangle {
+    in property <[string]> source-options;
+    callback source-picked(int);
+    callback duplicate();
+    callback delete();
+
+    width: 24px;
+    height: 24px;
+    border-radius: 5px;
+    background: ta.has-hover ? SC.hover : transparent;
+    accessible-role: button;
+    accessible-label: "More";
+    accessible-action-default => { cma.show({ x: 0, y: self.height }); }
+
+    for i in 3: Rectangle {
+        x: 6px + i * 5px;
+        y: 11px;
+        width: 2.5px;
+        height: 2.5px;
+        border-radius: 1.25px;
+        background: SC.secondary;
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { cma.show({ x: 0, y: self.height }); }
+    }
+
+    cma := ContextMenuArea {
+        width: 0;
+        height: 0;
+        enabled: false;
+        Menu {
+            Menu {
+                title: "Only links from";
+                for option[i] in root.source-options: MenuItem {
+                    title: option;
+                    activated => { root.source-picked(i); }
                 }
             }
-            ProfilePicker {
-                rule: rule;
-                browsers: browsers;
-                profile-picker-options: profile-picker-options;
-                profile-changed(id) => { root.profile-changed(rule.index, id); }
-                incognito-changed(v) => { root.incognito-changed(rule.index, v); }
+            MenuSeparator {}
+            MenuItem {
+                title: "Duplicate";
+                activated => { root.duplicate(); }
             }
-        }
-        Rectangle { horizontal-stretch: 1; }
-        TouchArea {
-            width: 28px;
-            height: 28px;
-            clicked => { root.remove(rule.index); }
-            Text { text: "➖"; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+            MenuItem {
+                title: "Delete";
+                activated => { root.delete(); }
+            }
         }
     }
 }
 
-component RulesTab inherits VerticalLayout {
-    in property <[SettingsRule]> rules;
-    in property <SettingsRule> default-rule;
-    in property <[BrowserItem]> browsers;
-    in property <[string]> profile-picker-options;
+// eye / crossed-out eye toggle that hides a row from the popup
+component EyeButton inherits Rectangle {
+    in property <bool> hidden;
+    callback clicked();
 
-    callback add-rule();
-    callback remove-rule(int);
-    callback url-changed(int, string);
-    callback profile-changed(int, string);
-    callback incognito-changed(int, bool);
+    width: 26px;
+    height: 26px;
+    border-radius: 5px;
+    background: ta.has-hover ? SC.hover : transparent;
+    accessible-role: button;
+    accessible-label: root.hidden ? "Show in the popup" : "Hide from the popup";
+    accessible-action-default => { root.clicked(); }
 
-    // no alignment here on purpose (leaving it at the default stretch) - it used to be set to
-    // start, which pinned every child, including the ScrollView below, to its minimum/preferred
-    // size instead of letting stretch hand out the leftover space, so the rule list never
-    // actually grew to fill the tab.
-    // same bug as the hotkey badges in main_window.slint's BrowserRow, just a different symptom.
-    spacing: 8px;
+    Icon {
+        commands: root.hidden
+            ? "M1.5 8 C3.2 4.8 5.4 3.3 8 3.3 C10.6 3.3 12.8 4.8 14.5 8 C12.8 11.2 10.6 12.7 8 12.7 C5.4 12.7 3.2 11.2 1.5 8 Z M8 5.8 C9.2 5.8 10.2 6.8 10.2 8 C10.2 9.2 9.2 10.2 8 10.2 C6.8 10.2 5.8 9.2 5.8 8 C5.8 6.8 6.8 5.8 8 5.8 Z M2.5 13.5 L13.5 2.5"
+            : "M1.5 8 C3.2 4.8 5.4 3.3 8 3.3 C10.6 3.3 12.8 4.8 14.5 8 C12.8 11.2 10.6 12.7 8 12.7 C5.4 12.7 3.2 11.2 1.5 8 Z M8 5.8 C9.2 5.8 10.2 6.8 10.2 8 C10.2 9.2 9.2 10.2 8 10.2 C6.8 10.2 5.8 9.2 5.8 8 C5.8 6.8 6.8 5.8 8 5.8 Z";
+        color: ta.has-hover ? SC.text : SC.secondary;
+    }
 
-    Card {
-        HorizontalLayout {
-            padding: 10px;
-            VerticalLayout {
-                Text { text: "If no rules match"; font-size: 12px; }
-                ProfilePicker {
-                    rule: root.default-rule;
-                    browsers: root.browsers;
-                    profile-picker-options: root.profile-picker-options;
-                    profile-changed(id) => { root.profile-changed(-1, id); }
-                    incognito-changed(v) => { root.incognito-changed(-1, v); }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component AppIcon inherits Rectangle {
+    in property <image> icon;
+    in property <bool> has-icon;
+    in property <string> letter;
+    in property <color> letter-color;
+    in property <length> size: 24px;
+    width: root.size;
+    height: root.size;
+
+    if root.has-icon: Image {
+        width: root.size;
+        height: root.size;
+        source: root.icon;
+        image-fit: contain;
+    }
+    if !root.has-icon: Rectangle {
+        width: root.size - 2px;
+        height: root.size - 2px;
+        border-radius: self.width / 2;
+        background: root.letter-color;
+        Text {
+            text: root.letter;
+            color: white;
+            font-size: root.size * 0.46;
+            font-weight: 600;
+        }
+    }
+}
+
+// one row of the Browsers page list.
+// Drag events are reported with the pointer's y inside the row, the list turns them into
+// content coordinates (rows don't move while a drag is in progress).
+component BrowserRowView inherits Rectangle {
+    in property <SettingsBrowserRow> item;
+    in property <bool> lifted;
+    in property <bool> menu-enabled: true;
+    in property <bool> show-handle: true;
+    callback eye-clicked();
+    callback chevron-clicked();
+    callback menu-picked(int);
+    callback drag-down(length);
+    callback drag-move(length);
+    callback drag-up();
+
+    height: SC.row-height;
+    border-radius: 8px;
+    background: root.lifted ? SC.raised : drag-area.has-hover ? SC.hover : transparent;
+    border-width: root.lifted ? 1px : 0;
+    border-color: SC.border;
+    drop-shadow-blur: root.lifted ? 14px : 0;
+    drop-shadow-offset-y: root.lifted ? 4px : 0;
+    drop-shadow-color: SC.dark ? #00000080 : #1d1d1f26;
+
+    property <length> indent: root.item.kind == 2 ? 30px : 0;
+    property <float> content-opacity: root.item.hidden ? 0.45 : 1;
+
+    // declared first so the eye/menu/chevron buttons below sit on top of it
+    drag-area := TouchArea {
+        enabled: root.item.draggable;
+        mouse-cursor: root.item.draggable ? (self.pressed ? MouseCursor.grabbing : MouseCursor.grab) : MouseCursor.default;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left) {
+                if (event.kind == PointerEventKind.down) {
+                    root.drag-down(self.mouse-y);
+                } else if (event.kind == PointerEventKind.up) {
+                    root.drag-up();
                 }
             }
         }
+        moved => { root.drag-move(self.mouse-y); }
     }
 
-    ScrollView {
-        vertical-stretch: 1;
-        VerticalLayout {
-            alignment: start;
-            spacing: 6px;
-            for rule[i] in root.rules: RuleCard {
-                rule: rule;
-                browsers: root.browsers;
-                profile-picker-options: root.profile-picker-options;
-                url-changed(idx, t) => { root.url-changed(idx, t); }
-                profile-changed(idx, id) => { root.profile-changed(idx, id); }
-                incognito-changed(idx, v) => { root.incognito-changed(idx, v); }
-                remove(idx) => { root.remove-rule(idx); }
-            }
+    if root.show-handle: DragHandle {
+        x: 8px + root.indent;
+        y: (parent.height - self.height) / 2;
+        dot-color: root.item.draggable ? (drag-area.has-hover || root.lifted ? SC.secondary : SC.tertiary) : transparent;
+    }
 
-            Text {
-                text: "URL matching examples:\n • github.com/Browsers-software/** starts with \"github.com/Browsers-software/\"\n • github.com/**/end starts with \"github.com/\" and ends with \"/end\"\n • github.com/*/end starts with \"github.com/\" and ends with \"/end\" but can have\n   only up to one path item in between\n\nSee https://github.com/Browsers-software/browsers/wiki/Rules for all the details.";
-                font-size: 11px;
-                color: Palette.foreground.transparentize(0.4);
-                wrap: word-wrap;
-            }
+    if root.item.kind == 1: Rectangle {
+        x: 22px;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        border-radius: 4px;
+        background: chevron-ta.has-hover ? SC.border : transparent;
+        Icon {
+            width: 10px;
+            height: 10px;
+            commands: root.item.collapsed ? "M6 4 L10 8 L6 12" : "M4 6 L8 10 L12 6";
+            color: SC.secondary;
+        }
+        chevron-ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.chevron-clicked(); }
+        }
+    }
+
+    AppIcon {
+        x: 44px + root.indent;
+        y: (parent.height - self.height) / 2;
+        size: root.item.kind == 2 ? 22px : 26px;
+        icon: root.item.icon;
+        has-icon: root.item.has-icon;
+        letter: root.item.letter;
+        letter-color: root.item.letter-color;
+        opacity: root.content-opacity;
+    }
+
+    VerticalLayout {
+        x: 80px + root.indent;
+        width: parent.width - self.x - 160px;
+        alignment: center;
+        Text {
+            text: root.item.name;
+            font-size: 13px;
+            font-weight: root.item.kind == 1 ? 500 : 400;
+            color: root.item.hidden ? SC.tertiary : SC.text;
+            overflow: elide;
+        }
+        if root.item.detail != "": Text {
+            text: root.lifted && root.item.kind == 1 ? root.item.detail + " · moves together" : root.item.detail;
+            font-size: 11px;
+            color: SC.tertiary;
+            overflow: elide;
         }
     }
 
     HorizontalLayout {
+        x: parent.width - self.width - 8px;
+        width: 170px;
         alignment: end;
-        Button {
-            text: "Add Rule";
-            clicked => { root.add-rule(); }
+        spacing: 4px;
+        if root.item.is-default: Text {
+            text: "Default profile";
+            font-size: 11px;
+            color: SC.secondary;
+            vertical-alignment: center;
+        }
+        if root.item.hidden: Text {
+            text: "Hidden";
+            font-size: 11px;
+            color: SC.tertiary;
+            vertical-alignment: center;
+        }
+        EyeButton {
+            y: (parent.height - self.height) / 2;
+            hidden: root.item.hidden;
+            clicked => { root.eye-clicked(); }
+        }
+        MoreButton {
+            y: (parent.height - self.height) / 2;
+            visible: root.menu-enabled;
+            options: !root.item.draggable
+                ? [root.item.is-default ? "Stop opening unmatched links here" : "Open unmatched links here"]
+                : root.item.kind == 1 ? ["Move to top", "Move to bottom"]
+                : ["Move to top", "Move to bottom", root.item.is-default ? "Stop opening unmatched links here" : "Open unmatched links here"];
+            picked(i) => { root.menu-picked(root.item.draggable ? i : i + 2); }
         }
     }
 }
 
-component AdvancedTab inherits VerticalLayout {
-    in property <[DirEntry]> directories;
-    callback set-default();
-    callback refresh();
+component SidebarItem inherits Rectangle {
+    in property <string> text;
+    in property <string> icon-commands;
+    in property <string> badge;
+    in property <bool> selected;
+    callback clicked();
 
-    alignment: start;
-    spacing: 10px;
+    height: 30px;
+    border-radius: 7px;
+    background: root.selected ? SC.accent : ta.has-hover ? (SC.dark ? #ffffff10 : #0000000a) : transparent;
+    accessible-role: tab;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
 
-    HorizontalLayout {
-        alignment: start;
-        Button {
-            text: "Set Browsers as a Default Browser";
-            clicked => { root.set-default(); }
+    Icon {
+        x: 10px;
+        y: (parent.height - self.height) / 2;
+        commands: root.icon-commands;
+        color: root.selected ? white : SC.secondary;
+    }
+    Text {
+        x: 34px;
+        y: (parent.height - self.height) / 2;
+        text: root.text;
+        font-size: 13px;
+        color: root.selected ? white : SC.text;
+    }
+    if root.badge != "": Text {
+        x: parent.width - self.width - 10px;
+        y: (parent.height - self.height) / 2;
+        text: root.badge;
+        font-size: 11px;
+        color: root.selected ? #ffffffcc : SC.secondary;
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component PageHeader inherits Rectangle {
+    in property <string> title;
+    height: 56px;
+    Text {
+        x: 20px;
+        y: (parent.height - self.height) / 2;
+        text: root.title;
+        font-size: 15px;
+        font-weight: 600;
+        color: SC.text;
+    }
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: SC.separator;
+    }
+    @children
+}
+
+component SectionLabel inherits Text {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+    color: SC.secondary;
+}
+
+// a titled toggle row on the General page
+component SettingRow inherits Rectangle {
+    in property <string> title;
+    in property <string> helper;
+    in property <bool> checked;
+    in property <bool> last;
+    callback toggled(bool);
+
+    height: root.helper == "" ? 44px : 58px;
+
+    VerticalLayout {
+        x: 14px;
+        width: parent.width - 80px;
+        alignment: center;
+        spacing: 2px;
+        Text {
+            text: root.title;
+            font-size: 13px;
+            color: SC.text;
+        }
+        if root.helper != "": Text {
+            text: root.helper;
+            font-size: 11px;
+            color: SC.secondary;
+            wrap: word-wrap;
         }
     }
-    HorizontalLayout {
-        alignment: start;
-        Button {
-            text: "Refresh Installed Applications";
-            clicked => { root.refresh(); }
-        }
+    Toggle {
+        x: parent.width - self.width - 14px;
+        y: (parent.height - self.height) / 2;
+        label: root.title;
+        checked: root.checked;
+        toggled(v) => { root.toggled(v); }
     }
+    if !root.last: Rectangle {
+        x: 14px;
+        y: parent.height - 1px;
+        width: parent.width - 14px;
+        height: 1px;
+        background: SC.separator;
+    }
+}
 
-    Text { text: "Directories"; font-size: 13px; }
-    DirectoriesList { directories: root.directories; }
+component CardBox inherits Rectangle {
+    background: SC.card;
+    border-color: SC.border;
+    border-width: 1px;
+    border-radius: 10px;
 }
 
 export component SettingsWindow inherits Window {
-    title: "Settings";
-    // tried preferred-width/preferred-height here first, but they don't actually take effect -
-    // the shown size just ends up being whatever the currently-visible tab's content computes to
-    // (General's, since it's the default tab), so Rules' wider content (a 300px LineEdit plus its
-    // row) never got the room it needed.
-    // width/height are a hard size Slint always honors, so using those instead - can't combine
-    // them with min-width/min-height though (compile error), so those had to go.
-    width: 750px;
-    height: 500px;
+    title: "Browsers Settings";
+    icon: root.app-icon;
+    width: 780px;
+    height: 520px;
+    background: SC.window;
+    default-font-size: 13px;
 
-    in-out property <SettingsTab> current-tab: SettingsTab.general;
+    // 0 = Browsers, 1 = Rules, 2 = General, 3 = About
+    in-out property <int> page: 0;
 
+    // ---- sidebar
+    in property <bool> is-default-browser;
+    callback set-default-browser();
+
+    // ---- Browsers page
+    in property <[SettingsBrowserRow]> browser-rows;
+    // apps that only open their own links (Slack, Zoom, ...): always first in the popup, so they
+    // can't be dragged
+    in property <[SettingsBrowserRow]> special-rows;
+    in property <bool> show-hidden;
+    in property <int> hidden-count;
+    in property <bool> reorder-enabled: true;
+    in property <int> banner-count;
+    in property <string> banner-names;
+    in property <string> found-text;
+    in property <string> order-hint;
+    in-out property <string> filter-text;
+    callback filter-changed(string);
+    callback show-hidden-toggled();
+    callback refresh();
+    callback hide-non-browsers();
+    callback dismiss-non-browser-banner();
+    callback browser-visibility-toggled(int);
+    callback special-visibility-toggled(int);
+    callback browser-group-toggled(int);
+    // 0 = move to top, 1 = move to bottom, 2 = toggle "open unmatched links here"
+    callback browser-menu-picked(int, int);
+    callback special-menu-picked(int, int);
+    // drop `from` so it lands before row `to` (to == row count means the end)
+    callback browser-rows-dropped(int, int);
+    // where a drag of row `from` released at insertion point `raw` actually lands
+    pure callback snap-browser-drop(int, int) -> int;
+
+    // ---- Rules page
+    in property <[SettingsRuleRow]> rules;
+    in property <[string]> target-options;
+    in property <[string]> source-options;
+    in property <bool> has-draft;
+    in property <string> draft-source-label;
+    in property <string> draft-target-label;
+    in property <string> draft-help;
+    in property <bool> draft-pattern-invalid;
+    in-out property <string> draft-pattern;
+    in-out property <string> test-url;
+    in property <string> test-source-label;
+    in property <string> test-result-text;
+    // 0 = nothing typed yet, 1 = a rule matches, 2 = fallback, 3 = not a link
+    in property <int> test-result-kind;
+    in property <int> matched-rule: -1;
+    in property <string> fallback-target-label;
+    in property <image> fallback-target-icon;
+    in property <bool> fallback-target-has-icon;
+    in property <bool> fallback-private;
+    in property <bool> fallback-supports-private;
+    callback add-rule();
+    // returns whether the pattern is valid (and got saved)
+    callback rule-pattern-edited(int, string) -> bool;
+    callback rule-source-picked(int, int);
+    callback rule-target-picked(int, int);
+    callback rule-private-toggled(int);
+    // 0 = duplicate, 1 = delete
+    callback rule-menu-picked(int, int);
+    callback rules-dropped(int, int);
+    callback draft-pattern-edited(string);
+    callback draft-pattern-committed();
+    callback draft-source-picked(int);
+    callback draft-target-picked(int);
+    callback draft-discarded();
+    callback test-url-edited(string);
+    callback test-source-picked(int);
+    callback fallback-target-picked(int);
+    callback fallback-private-toggled();
+
+    // ---- General page
+    in property <ThemeChoice> theme;
     in property <bool> show-hotkeys;
     in property <bool> quit-on-lost-focus;
     in property <bool> show-quit-on-lost-focus;
     in property <bool> unwrap-urls;
-    in property <[RestorableProfile]> restorable-app-profiles;
-
-    in property <ThemeChoice> theme;
-
-    in property <[SettingsRule]> rules;
-    in property <SettingsRule> default-rule;
-    in property <[BrowserItem]> browsers;
-    in property <[string]> profile-picker-options;
-
-    in property <[DirEntry]> directories;
-
+    in property <bool> run-in-background;
+    callback theme-changed(ThemeChoice);
     callback show-hotkeys-changed(bool);
     callback quit-on-lost-focus-changed(bool);
     callback unwrap-urls-changed(bool);
-    callback restore-profile(string);
-    callback theme-changed(ThemeChoice);
-    callback add-rule();
-    callback remove-rule(int);
-    callback rule-url-changed(int, string);
-    callback rule-profile-changed(int, string);
-    callback rule-incognito-changed(int, bool);
-    callback set-default-browser();
-    callback refresh();
+    callback run-in-background-changed(bool);
 
-    Rectangle {
-        background: Palette.background;
+    // ---- About page
+    in property <image> app-icon;
+    in property <string> version-text;
+    in property <[DirEntry]> directories;
 
-        HorizontalLayout {
-            sidebar := VerticalLayout {
-                width: 190px;
-                padding: 10px;
-                spacing: 4px;
+    // debug builds only (BROWSERS_DEBUG_HOLD_DRAG): a drag ignores the mouse release, so a
+    // screenshot can show it in progress
+    in property <bool> debug-hold-drag;
+
+    // ---- Browsers drag state, in list content coordinates
+    property <int> b-drag-from: -1;
+    property <bool> b-dragging;
+    property <length> b-press-y;
+    property <length> b-grab-offset;
+    property <length> b-event-y;
+    property <length> b-event-viewport-y;
+    property <length> b-viewport-y;
+    property <length> b-drag-y: root.b-event-y + root.b-event-viewport-y - root.b-viewport-y;
+    property <int> b-raw-target: Math.clamp(Math.round((root.b-drag-y - root.b-grab-offset + SC.row-height / 2) / SC.row-height), 0, root.browser-rows.length);
+    property <int> b-target: root.b-dragging ? root.snap-browser-drop(root.b-drag-from, root.b-raw-target) : -1;
+    // the lifted row gets a slot of its own at the drop point while dragging
+    property <length> b-extra: root.b-dragging ? SC.row-height : 0;
+
+    // ---- Rules drag state, in rules-list coordinates
+    property <int> r-drag-from: -1;
+    property <bool> r-dragging;
+    property <length> r-press-y;
+    property <length> r-grab-offset;
+    property <length> r-event-y;
+    property <length> r-drag-y: root.r-event-y;
+    property <int> r-target: Math.clamp(Math.round((root.r-drag-y - root.r-grab-offset + SC.rule-pitch / 2) / SC.rule-pitch), 0, root.rules.length);
+
+    function end-browser-drag() {
+        if (root.b-dragging && root.b-target >= 0) {
+            root.browser-rows-dropped(root.b-drag-from, root.b-target);
+        }
+        root.b-dragging = false;
+        root.b-drag-from = -1;
+    }
+
+    function end-rule-drag() {
+        if (root.r-dragging && root.r-target != root.r-drag-from && root.r-target != root.r-drag-from + 1) {
+            root.rules-dropped(root.r-drag-from, root.r-target);
+        }
+        root.r-dragging = false;
+        root.r-drag-from = -1;
+    }
+
+    HorizontalLayout {
+        // ------------------------------------------------------------------ sidebar
+        Rectangle {
+            width: 184px;
+            background: SC.sidebar;
+
+            Rectangle {
+                x: parent.width - 1px;
+                width: 1px;
+                background: SC.separator;
+            }
+
+            VerticalLayout {
+                y: 14px;
+                height: 4 * 32px;
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 2px;
                 alignment: start;
 
-                for t in [
-                    { tab: SettingsTab.general, label: "General" },
-                    { tab: SettingsTab.appearance, label: "Appearance" },
-                    { tab: SettingsTab.rules, label: "Rules" },
-                    { tab: SettingsTab.advanced, label: "Advanced" },
-                ]: TouchArea {
-                    height: 30px;
-                    clicked => { root.current-tab = t.tab; }
-                    Rectangle {
-                        background: root.current-tab == t.tab ? Palette.accent-background : transparent;
-                        border-radius: 5px;
+                SidebarItem {
+                    text: "Browsers";
+                    icon-commands: "M8 1.8 C11.4 1.8 14.2 4.6 14.2 8 C14.2 11.4 11.4 14.2 8 14.2 C4.6 14.2 1.8 11.4 1.8 8 C1.8 4.6 4.6 1.8 8 1.8 Z M1.8 8 L14.2 8 M8 1.8 C5.9 4.2 5.9 11.8 8 14.2 M8 1.8 C10.1 4.2 10.1 11.8 8 14.2";
+                    selected: root.page == 0;
+                    clicked => { root.page = 0; }
+                }
+                SidebarItem {
+                    text: "Rules";
+                    icon-commands: "M2.5 4 L8.5 4 M2.5 8 L8.5 8 M2.5 12 L8.5 12 M10.5 8 L14 8 M12 6 L14 8 L12 10";
+                    badge: root.rules.length > 0 ? root.rules.length : "";
+                    selected: root.page == 1;
+                    clicked => { root.page = 1; }
+                }
+                SidebarItem {
+                    text: "General";
+                    icon-commands: "M2 5 L14 5 M2 11 L14 11 M5.5 3 L5.5 7 M10.5 9 L10.5 13";
+                    selected: root.page == 2;
+                    clicked => { root.page = 2; }
+                }
+                SidebarItem {
+                    text: "About";
+                    icon-commands: "M8 1.8 C11.4 1.8 14.2 4.6 14.2 8 C14.2 11.4 11.4 14.2 8 14.2 C4.6 14.2 1.8 11.4 1.8 8 C1.8 4.6 4.6 1.8 8 1.8 Z M8 7.2 L8 11.4 M8 4.6 L8 5.2";
+                    selected: root.page == 3;
+                    clicked => { root.page = 3; }
+                }
+            }
+
+            // default browser status
+            Rectangle {
+                x: 10px;
+                y: parent.height - self.height - 12px;
+                width: parent.width - 20px;
+                height: root.is-default-browser ? 62px : 92px;
+                background: SC.raised;
+                border-radius: 9px;
+                border-width: 1px;
+                border-color: SC.border;
+
+                Rectangle {
+                    x: 11px;
+                    y: 15px;
+                    width: 7px;
+                    height: 7px;
+                    border-radius: 3.5px;
+                    background: root.is-default-browser ? SC.success : SC.warning;
+                }
+                Text {
+                    x: 24px;
+                    y: 10px;
+                    text: root.is-default-browser ? "Default browser" : "Not the default browser";
+                    font-size: 11.5px;
+                    font-weight: 600;
+                    color: SC.text;
+                }
+                Text {
+                    x: 11px;
+                    y: 28px;
+                    width: parent.width - 22px;
+                    text: root.is-default-browser ? "Links from every app come here." : "Links skip Browsers for now.";
+                    font-size: 11px;
+                    color: SC.secondary;
+                    wrap: word-wrap;
+                }
+                if !root.is-default-browser: PillButton {
+                    x: 10px;
+                    y: 56px;
+                    width: parent.width - 20px;
+                    text: "Make default";
+                    primary: true;
+                    clicked => { root.set-default-browser(); }
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ pages
+        Rectangle {
+            horizontal-stretch: 1;
+
+            // ============================================================ Browsers
+            if root.page == 0: Rectangle {
+                header := PageHeader {
+                    y: 0;
+                    title: "Browsers";
+
+                    HorizontalLayout {
+                        x: parent.width - self.width - 16px;
+                        y: (parent.height - 28px) / 2;
+                        width: self.preferred-width;
+                        height: 28px;
+                        spacing: 8px;
+                        Field {
+                            width: 170px;
+                            placeholder: "Filter";
+                            icon-commands: "M7 2.5 C9.5 2.5 11.5 4.5 11.5 7 C11.5 9.5 9.5 11.5 7 11.5 C4.5 11.5 2.5 9.5 2.5 7 C2.5 4.5 4.5 2.5 7 2.5 Z M10.3 10.3 L13.5 13.5";
+                            text <=> root.filter-text;
+                            edited(t) => { root.filter-changed(t); }
+                        }
+                        PillButton {
+                            y: 1px;
+                            text: "Show hidden";
+                            badge: root.hidden-count > 0 ? root.hidden-count : "";
+                            active: root.show-hidden;
+                            clicked => { root.show-hidden-toggled(); }
+                        }
+                        PillButton {
+                            y: 1px;
+                            text: "Rescan";
+                            icon-commands: "M13 8 C13 10.8 10.8 13 8 13 C5.2 13 3 10.8 3 8 C3 5.2 5.2 3 8 3 C9.6 3 11 3.7 11.9 4.9 M12.2 2 L12.2 5.2 L9 5.2";
+                            clicked => { root.refresh(); }
+                        }
+                    }
+                }
+
+                property <length> banner-height: root.banner-count > 0 ? 84px : 0;
+
+                if root.banner-count > 0: Rectangle {
+                    x: 16px;
+                    y: header.height + 14px;
+                    width: parent.width - 32px;
+                    height: 66px;
+                    border-radius: 9px;
+                    background: SC.accent-soft;
+                    border-width: 1px;
+                    border-color: SC.accent-border;
+
+                    VerticalLayout {
+                        x: 14px;
+                        width: parent.width - 200px;
+                        alignment: center;
+                        spacing: 3px;
                         Text {
-                            text: t.label;
-                            font-size: 14px;
-                            x: 12px;
-                            color: root.current-tab == t.tab ? Palette.accent-foreground : Palette.foreground;
-                            vertical-alignment: center;
+                            text: root.banner-count == 1 ? "1 of these isn't a web browser" : "\{root.banner-count} of these aren't web browsers";
+                            font-size: 12.5px;
+                            font-weight: 600;
+                            color: SC.text;
+                        }
+                        Text {
+                            text: "\{root.banner-names} can open links, but you probably don't want them in the popup.";
+                            font-size: 11px;
+                            color: SC.secondary;
+                            wrap: word-wrap;
+                        }
+                    }
+                    HorizontalLayout {
+                        x: parent.width - self.width - 14px;
+                        y: (parent.height - 26px) / 2;
+                        width: self.preferred-width;
+                        height: 26px;
+                        spacing: 6px;
+                        PillButton {
+                            text: "Hide them";
+                            primary: true;
+                            clicked => { root.hide-non-browsers(); }
+                        }
+                        PillButton {
+                            text: "Not now";
+                            link: true;
+                            clicked => { root.dismiss-non-browser-banner(); }
+                        }
+                    }
+                }
+
+                property <length> list-top: header.height + banner-height + 8px;
+
+                SectionLabel {
+                    x: 22px;
+                    y: list-top + 6px;
+                    text: "POPUP ORDER";
+                }
+                Text {
+                    x: parent.width - self.width - 22px;
+                    y: list-top + 6px;
+                    text: root.order-hint;
+                    font-size: 11px;
+                    color: SC.tertiary;
+                }
+
+                property <length> footer-height: 44px;
+
+                sv := ScrollView {
+                    x: 12px;
+                    y: list-top + 26px;
+                    width: parent.width - 24px;
+                    height: parent.height - self.y - footer-height;
+                    content-width: self.visible-width;
+                    content-height: list-content.height;
+                    changed content-y => { root.b-viewport-y = self.content-y; }
+
+                    list-content := Rectangle {
+                        width: sv.visible-width;
+                        height: root.browser-rows.length * SC.row-height + root.b-extra
+                            + (root.special-rows.length > 0 ? 40px + root.special-rows.length * SC.row-height : 0) + 8px;
+
+                        for row[i] in root.browser-rows: Rectangle {
+                            x: 4px;
+                            // rows from the drop point on make room for the lifted row
+                            y: i * SC.row-height + (root.b-dragging && i >= root.b-target ? SC.row-height : 0);
+                            width: parent.width - 8px;
+                            height: SC.row-height;
+                            animate y { duration: 120ms; easing: ease-out; }
+
+                            property <bool> is-origin: root.b-dragging && root.b-drag-from == i;
+
+                            BrowserRowView {
+                                item: row;
+                                opacity: is-origin ? 0 : 1;
+                                eye-clicked => { root.browser-visibility-toggled(i); }
+                                chevron-clicked => { root.browser-group-toggled(i); }
+                                menu-picked(action) => { root.browser-menu-picked(i, action); }
+                                drag-down(y) => {
+                                    if (root.b-dragging) {
+                                        // the release of a debug-held drag
+                                        root.end-browser-drag();
+                                        return;
+                                    }
+                                    root.b-drag-from = i;
+                                    root.b-press-y = y;
+                                    root.b-grab-offset = y;
+                                    root.b-event-y = parent.y + y;
+                                    root.b-event-viewport-y = sv.content-y;
+                                }
+                                drag-move(y) => {
+                                    if (root.b-drag-from != i) {
+                                        return;
+                                    }
+                                    root.b-event-y = parent.y + y;
+                                    root.b-event-viewport-y = sv.content-y;
+                                    if (!root.b-dragging && Math.abs(y - root.b-press-y) > 4px && row.draggable) {
+                                        root.b-dragging = true;
+                                    }
+                                }
+                                drag-up => {
+                                    if (root.debug-hold-drag && root.b-dragging) {
+                                        return;
+                                    }
+                                    root.end-browser-drag();
+                                }
+                            }
+
+                            // the empty slot the lifted row came from
+                            if is-origin: DashedBox {
+                                dash-color: SC.accent-border;
+                                background: SC.slot;
+                                border-radius: 8px;
+                            }
+                        }
+
+                        // the lifted row, in the slot it would drop into
+                        if root.b-dragging: BrowserRowView {
+                            x: 4px;
+                            y: root.b-target * SC.row-height + 2px;
+                            animate y { duration: 120ms; easing: ease-out; }
+                            width: parent.width - 8px;
+                            item: root.browser-rows[root.b-drag-from];
+                            lifted: true;
+                        }
+
+                        // drop indicator
+                        if root.b-dragging && root.b-target >= 0: Rectangle {
+                            x: 8px;
+                            y: root.b-target * SC.row-height - 1px;
+                            width: parent.width - 20px;
+                            height: 2px;
+                            background: SC.accent;
+                            Rectangle {
+                                x: -3px;
+                                y: -3px;
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                border-width: 2px;
+                                border-color: SC.accent;
+                                background: SC.window;
+                            }
+                        }
+
+                        if root.special-rows.length > 0: SectionLabel {
+                            x: 10px;
+                            y: root.browser-rows.length * SC.row-height + root.b-extra + 18px;
+                            text: "ONLY FOR THEIR OWN LINKS · ALWAYS LISTED FIRST";
+                        }
+
+                        for row[i] in root.special-rows: BrowserRowView {
+                            x: 4px;
+                            y: root.browser-rows.length * SC.row-height + root.b-extra + 40px + i * SC.row-height;
+                            width: parent.width - 8px;
+                            item: row;
+                            show-handle: false;
+                            eye-clicked => { root.special-visibility-toggled(i); }
+                            menu-picked(action) => { root.special-menu-picked(i, action); }
+                        }
+
+                        if root.browser-rows.length == 0 && root.special-rows.length == 0: Text {
+                            y: 30px;
+                            width: parent.width;
+                            horizontal-alignment: center;
+                            text: root.filter-text != "" ? "Nothing matches \"\{root.filter-text}\"" : "No apps found. Try Rescan.";
+                            color: SC.secondary;
+                        }
+                    }
+                }
+
+                // keeps the list scrolling while the pointer rests near its top/bottom edge
+                Timer {
+                    interval: 16ms;
+                    running: root.b-dragging;
+                    triggered => {
+                        // b-drag-y + viewport-y is the pointer position inside the visible part
+                        // of the list
+                        if (root.b-drag-y + sv.content-y < 24px && sv.content-y < 0) {
+                            sv.content-y = Math.min(0, sv.content-y + 6px);
+                        } else if (root.b-drag-y + sv.content-y > sv.visible-height - 24px && sv.content-y > sv.visible-height - sv.content-height) {
+                            sv.content-y = Math.max(sv.visible-height - sv.content-height, sv.content-y - 6px);
+                        }
+                    }
+                }
+
+                // footer
+                Rectangle {
+                    x: 16px;
+                    y: parent.height - footer-height;
+                    width: parent.width - 32px;
+                    height: 1px;
+                    background: SC.separator;
+                }
+                add-app := PillButton {
+                    x: 16px;
+                    y: parent.height - footer-height + (footer-height - self.height) / 2;
+                    text: "+ Add an app…";
+                    link: true;
+                    enabled: false;
+                }
+                if add-app-ta.has-hover: Rectangle {
+                    x: 16px;
+                    y: add-app.y - 30px;
+                    width: tip.preferred-width + 16px;
+                    height: 24px;
+                    border-radius: 5px;
+                    background: SC.dark ? #3a3a40 : #2c2c30;
+                    tip := Text {
+                        text: "Coming soon - apps that can open links are found automatically";
+                        font-size: 11px;
+                        color: white;
+                    }
+                }
+                add-app-ta := TouchArea {
+                    x: add-app.x;
+                    y: add-app.y;
+                    width: add-app.width;
+                    height: add-app.height;
+                }
+                Text {
+                    x: parent.width - self.width - 20px;
+                    y: parent.height - footer-height + (footer-height - self.height) / 2;
+                    text: root.found-text;
+                    font-size: 11px;
+                    color: SC.tertiary;
+                }
+            }
+
+            // ============================================================ Rules
+            if root.page == 1: Rectangle {
+                rules-header := PageHeader {
+                    y: 0;
+                    title: "Rules";
+                    PillButton {
+                        x: parent.width - self.width - 16px;
+                        y: (parent.height - self.height) / 2;
+                        text: "+ New rule";
+                        primary: true;
+                        clicked => { root.add-rule(); }
+                    }
+                }
+
+                property <length> test-height: 104px;
+                property <length> draft-height: root.has-draft ? 84px : 0;
+                property <length> rules-top: test-height + 16px + 30px;
+                property <length> rules-height: root.rules.length * SC.rule-pitch + (root.r-dragging ? SC.rule-pitch : 0);
+
+                rules-sv := ScrollView {
+                    y: rules-header.height;
+                    height: parent.height - rules-header.height;
+                    content-width: self.visible-width;
+                    content-height: rules-top + rules-height + draft-height + 72px + 16px;
+
+                    Rectangle {
+                        x: 16px;
+                        y: 0;
+                        width: rules-sv.visible-width - 32px;
+                        height: rules-sv.content-height;
+
+                        // test a link
+                        CardBox {
+                            y: 16px;
+                            height: test-height - 16px;
+
+                            SectionLabel {
+                                x: 14px;
+                                y: 12px;
+                                text: "TEST A LINK";
+                            }
+                            HorizontalLayout {
+                                x: 14px;
+                                y: 30px;
+                                width: parent.width - 28px;
+                                height: 28px;
+                                spacing: 8px;
+                                Field {
+                                    placeholder: "Paste a link, like https://github.com/acme/api";
+                                    text <=> root.test-url;
+                                    edited(t) => { root.test-url-edited(t); }
+                                }
+                                Text {
+                                    text: "from";
+                                    font-size: 12px;
+                                    color: SC.secondary;
+                                    vertical-alignment: center;
+                                }
+                                Picker {
+                                    width: 130px;
+                                    label: root.test-source-label;
+                                    options: root.source-options;
+                                    picked(i) => { root.test-source-picked(i); }
+                                }
+                            }
+                            if root.test-result-kind != 0: Rectangle {
+                                x: 14px;
+                                y: 68px;
+                                width: parent.width - 28px;
+                                height: 16px;
+                                Rectangle {
+                                    x: 0;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 6px;
+                                    height: 6px;
+                                    border-radius: 3px;
+                                    background: root.test-result-kind == 1 ? SC.accent : root.test-result-kind == 2 ? SC.secondary : SC.danger;
+                                }
+                                Text {
+                                    x: 13px;
+                                    width: parent.width - 13px;
+                                    height: parent.height;
+                                    vertical-alignment: center;
+                                    text: root.test-result-text;
+                                    font-size: 12px;
+                                    color: SC.text;
+                                    overflow: elide;
+                                }
+                            }
+                            if root.test-result-kind == 0: Text {
+                                x: 14px;
+                                y: 68px;
+                                text: "See which rule a link would use before you click it.";
+                                font-size: 12px;
+                                color: SC.tertiary;
+                            }
+                        }
+
+                        SectionLabel {
+                            x: 6px;
+                            y: test-height + 16px + 8px;
+                            text: "CHECKED TOP TO BOTTOM · FIRST MATCH WINS";
+                        }
+
+                        rules-list := Rectangle {
+                            y: rules-top;
+                            height: rules-height;
+
+                            for rule[i] in root.rules: Rectangle {
+                                y: i * SC.rule-pitch + (root.r-dragging && i >= root.r-target ? SC.rule-pitch : 0);
+                                animate y { duration: 120ms; easing: ease-out; }
+                                height: SC.rule-pitch - 6px;
+                                border-radius: 8px;
+                                property <bool> matched: root.matched-rule == i;
+                                property <bool> is-origin: root.r-dragging && root.r-drag-from == i;
+                                background: matched ? SC.accent-soft : SC.raised;
+                                border-width: matched ? 1.5px : 1px;
+                                border-color: matched ? SC.accent : SC.border;
+                                opacity: is-origin ? 0 : 1;
+
+                                rule-handle := TouchArea {
+                                    x: 0;
+                                    width: 46px;
+                                    mouse-cursor: self.pressed ? MouseCursor.grabbing : MouseCursor.grab;
+                                    pointer-event(event) => {
+                                        if (event.button == PointerEventButton.left) {
+                                            if (event.kind == PointerEventKind.down) {
+                                                if (root.r-dragging) {
+                                                    root.end-rule-drag();
+                                                    return;
+                                                }
+                                                root.r-drag-from = i;
+                                                root.r-press-y = self.mouse-y;
+                                                root.r-grab-offset = self.mouse-y;
+                                                root.r-event-y = parent.y + self.mouse-y;
+                                            } else if (event.kind == PointerEventKind.up) {
+                                                if (root.debug-hold-drag && root.r-dragging) {
+                                                    return;
+                                                }
+                                                root.end-rule-drag();
+                                            }
+                                        }
+                                    }
+                                    moved => {
+                                        if (root.r-drag-from != i) {
+                                            return;
+                                        }
+                                        root.r-event-y = parent.y + self.mouse-y;
+                                        if (!root.r-dragging && Math.abs(self.mouse-y - root.r-press-y) > 4px) {
+                                            root.r-dragging = true;
+                                        }
+                                    }
+                                }
+                                DragHandle {
+                                    x: 10px;
+                                    y: (parent.height - self.height) / 2;
+                                    dot-color: rule-handle.has-hover ? SC.secondary : SC.tertiary;
+                                }
+                                Text {
+                                    x: 26px;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 14px;
+                                    horizontal-alignment: center;
+                                    text: i + 1;
+                                    font-size: 12px;
+                                    font-weight: matched ? 600 : 400;
+                                    color: matched ? SC.accent-text : SC.tertiary;
+                                }
+
+                                // pattern + from-app chips
+                                HorizontalLayout {
+                                    x: 48px;
+                                    y: (parent.height - 24px) / 2;
+                                    height: 24px;
+                                    width: parent.width - self.x - 300px;
+                                    spacing: 6px;
+                                    alignment: start;
+
+                                    if rule.pattern != "": Rectangle {
+                                        property <bool> invalid;
+                                        width: Math.min(pattern-input.preferred-width + 16px, parent.width - (rule.source-label != "" ? 120px : 0));
+                                        border-radius: 5px;
+                                        background: SC.chip;
+                                        border-width: pattern-input.has-focus || self.invalid ? 1px : 0;
+                                        border-color: self.invalid ? SC.danger : SC.accent;
+                                        pattern-input := TextInput {
+                                            x: 8px;
+                                            width: parent.width - 16px;
+                                            vertical-alignment: center;
+                                            single-line: true;
+                                            text: rule.pattern;
+                                            font-family: "Menlo";
+                                            font-size: 11.5px;
+                                            color: SC.text;
+                                            accessible-label: "Rule \{i + 1} pattern";
+                                            edited => { parent.invalid = !root.rule-pattern-edited(i, self.text); }
+                                        }
+                                    }
+                                    if rule.pattern == "": Text {
+                                        text: "any link";
+                                        font-size: 12px;
+                                        color: SC.secondary;
+                                        vertical-alignment: center;
+                                    }
+                                    if rule.source-label != "": Picker {
+                                        chip: true;
+                                        width: Math.min(source-text.preferred-width + 16px, 150px);
+                                        label: "from " + rule.source-label;
+                                        options: root.source-options;
+                                        picked(s) => { root.rule-source-picked(i, s); }
+                                        source-text := Text {
+                                            visible: false;
+                                            text: "from " + rule.source-label;
+                                            font-size: 12px;
+                                        }
+                                    }
+                                }
+
+                                Icon {
+                                    x: parent.width - 284px;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 14px;
+                                    height: 14px;
+                                    commands: "M2.5 8 L13 8 M9 4.5 L13 8 L9 11.5";
+                                    color: SC.tertiary;
+                                }
+                                Picker {
+                                    x: parent.width - 262px;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 170px;
+                                    label: rule.target-label;
+                                    icon: rule.target-icon;
+                                    has-icon: rule.target-has-icon;
+                                    options: root.target-options;
+                                    picked(t) => { root.rule-target-picked(i, t); }
+                                }
+                                if rule.supports-private: Rectangle {
+                                    x: parent.width - 86px;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 54px;
+                                    height: 20px;
+                                    border-radius: 10px;
+                                    background: rule.private ? SC.private-bg : transparent;
+                                    border-width: rule.private ? 0 : 1px;
+                                    border-color: SC.border;
+                                    accessible-role: checkbox;
+                                    accessible-label: "Private";
+                                    accessible-checked: rule.private;
+                                    accessible-action-default => { root.rule-private-toggled(i); }
+                                    Text {
+                                        text: "Private";
+                                        font-size: 11px;
+                                        font-weight: rule.private ? 600 : 400;
+                                        color: rule.private ? SC.private-text : SC.tertiary;
+                                    }
+                                    TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.rule-private-toggled(i); }
+                                    }
+                                }
+                                RuleMoreButton {
+                                    x: parent.width - self.width - 6px;
+                                    y: (parent.height - self.height) / 2;
+                                    source-options: root.source-options;
+                                    source-picked(s) => { root.rule-source-picked(i, s); }
+                                    duplicate => { root.rule-menu-picked(i, 0); }
+                                    delete => { root.rule-menu-picked(i, 1); }
+                                }
+                            }
+
+                            // the empty slot the lifted rule came from
+                            if root.r-dragging: DashedBox {
+                                y: root.r-drag-from * SC.rule-pitch + (root.r-drag-from >= root.r-target ? SC.rule-pitch : 0);
+                                animate y { duration: 120ms; easing: ease-out; }
+                                height: SC.rule-pitch - 6px;
+                                dash-color: SC.accent-border;
+                                background: SC.slot;
+                                border-radius: 8px;
+                            }
+                            // drop indicator
+                            if root.r-dragging: Rectangle {
+                                x: 4px;
+                                y: root.r-target * SC.rule-pitch - 4px;
+                                width: parent.width - 8px;
+                                height: 2px;
+                                background: SC.accent;
+                                Rectangle {
+                                    x: -3px;
+                                    y: -3px;
+                                    width: 8px;
+                                    height: 8px;
+                                    border-radius: 4px;
+                                    border-width: 2px;
+                                    border-color: SC.accent;
+                                    background: SC.window;
+                                }
+                            }
+                            if root.r-dragging: Rectangle {
+                                y: root.r-target * SC.rule-pitch;
+                                animate y { duration: 120ms; easing: ease-out; }
+                                height: SC.rule-pitch - 6px;
+                                border-radius: 8px;
+                                background: SC.raised;
+                                border-width: 1px;
+                                border-color: SC.border;
+                                drop-shadow-blur: 14px;
+                                drop-shadow-offset-y: 4px;
+                                drop-shadow-color: SC.dark ? #00000080 : #1d1d1f26;
+                                DragHandle {
+                                    x: 10px;
+                                    y: (parent.height - self.height) / 2;
+                                    dot-color: SC.secondary;
+                                }
+                                Text {
+                                    x: 26px;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 14px;
+                                    horizontal-alignment: center;
+                                    text: root.r-drag-from + 1;
+                                    font-size: 12px;
+                                    color: SC.tertiary;
+                                }
+                                Text {
+                                    x: 56px;
+                                    y: (parent.height - self.height) / 2;
+                                    text: root.rules[root.r-drag-from].pattern != "" ? root.rules[root.r-drag-from].pattern : "any link";
+                                    font-family: "Menlo";
+                                    font-size: 11.5px;
+                                    color: SC.text;
+                                }
+                                Text {
+                                    x: parent.width - 262px;
+                                    y: (parent.height - self.height) / 2;
+                                    text: "→  " + root.rules[root.r-drag-from].target-label;
+                                    font-size: 12px;
+                                    color: SC.secondary;
+                                }
+                            }
+                        }
+
+                        // the rule being added - not saved until it has a pattern (or an app)
+                        // and a target
+                        if root.has-draft: DashedBox {
+                            y: rules-top + rules-height;
+                            height: draft-height - 6px;
+                            dash-color: SC.accent-border;
+                            background: SC.slot;
+                            border-radius: 8px;
+
+                            Text {
+                                x: 26px;
+                                y: 14px + (28px - self.height) / 2;
+                                width: 14px;
+                                horizontal-alignment: center;
+                                text: root.rules.length + 1;
+                                font-size: 12px;
+                                color: SC.accent-text;
+                            }
+                            draft-field := Field {
+                                x: 48px;
+                                y: 14px;
+                                width: parent.width - 440px;
+                                mono: true;
+                                invalid: root.draft-pattern-invalid;
+                                placeholder: root.draft-source-label != "" ? "any link" : "e.g. notion.so";
+                                text <=> root.draft-pattern;
+                                edited(t) => { root.draft-pattern-edited(t); }
+                                accepted => { root.draft-pattern-committed(); }
+                                focus-lost => { root.draft-pattern-committed(); }
+                                init => { self.focus-input(); }
+                            }
+                            Picker {
+                                x: parent.width - 384px;
+                                y: 14px + 3px;
+                                width: 86px;
+                                chip: true;
+                                label: root.draft-source-label != "" ? root.draft-source-label : "+ from app";
+                                placeholder: root.draft-source-label == "";
+                                options: root.source-options;
+                                picked(s) => { root.draft-source-picked(s); }
+                            }
+                            Icon {
+                                x: parent.width - 284px;
+                                y: 14px + 7px;
+                                width: 14px;
+                                height: 14px;
+                                commands: "M2.5 8 L13 8 M9 4.5 L13 8 L9 11.5";
+                                color: SC.tertiary;
+                            }
+                            Picker {
+                                x: parent.width - 262px;
+                                y: 14px;
+                                width: 170px;
+                                label: root.draft-target-label != "" ? root.draft-target-label : "Choose…";
+                                placeholder: root.draft-target-label == "";
+                                options: root.target-options;
+                                picked(t) => { root.draft-target-picked(t); }
+                            }
+                            Rectangle {
+                                x: parent.width - self.width - 6px;
+                                y: 14px + 2px;
+                                width: 24px;
+                                height: 24px;
+                                border-radius: 5px;
+                                background: discard-ta.has-hover ? SC.hover : transparent;
+                                accessible-role: button;
+                                accessible-label: "Discard new rule";
+                                accessible-action-default => { root.draft-discarded(); }
+                                Icon {
+                                    width: 12px;
+                                    height: 12px;
+                                    commands: "M4 4 L12 12 M12 4 L4 12";
+                                    color: SC.secondary;
+                                }
+                                discard-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.draft-discarded(); }
+                                }
+                            }
+                            Text {
+                                x: 48px;
+                                y: 50px;
+                                width: parent.width - 60px;
+                                text: root.draft-help;
+                                font-size: 11px;
+                                color: root.draft-pattern-invalid ? SC.danger : SC.secondary;
+                                overflow: elide;
+                            }
+                        }
+
+                        // everything else
+                        CardBox {
+                            y: rules-top + rules-height + draft-height + 6px;
+                            height: 58px;
+                            property <bool> matched: root.test-result-kind == 2;
+                            background: matched ? SC.accent-soft : SC.card;
+                            border-color: matched ? SC.accent : SC.border;
+                            border-width: matched ? 1.5px : 1px;
+
+                            VerticalLayout {
+                                x: 48px;
+                                width: parent.width - 330px;
+                                alignment: center;
+                                spacing: 1px;
+                                Text {
+                                    text: "Everything else";
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    color: SC.text;
+                                }
+                                Text {
+                                    text: "When no rule matches";
+                                    font-size: 11px;
+                                    color: SC.secondary;
+                                }
+                            }
+                            Icon {
+                                x: parent.width - 284px;
+                                y: (parent.height - self.height) / 2;
+                                width: 14px;
+                                height: 14px;
+                                commands: "M2.5 8 L13 8 M9 4.5 L13 8 L9 11.5";
+                                color: SC.tertiary;
+                            }
+                            Picker {
+                                x: parent.width - 262px;
+                                y: (parent.height - self.height) / 2;
+                                width: 170px;
+                                label: root.fallback-target-label;
+                                icon: root.fallback-target-icon;
+                                has-icon: root.fallback-target-has-icon;
+                                options: root.target-options;
+                                picked(t) => { root.fallback-target-picked(t); }
+                            }
+                            if root.fallback-supports-private: Rectangle {
+                                x: parent.width - 86px;
+                                y: (parent.height - self.height) / 2;
+                                width: 54px;
+                                height: 20px;
+                                border-radius: 10px;
+                                background: root.fallback-private ? SC.private-bg : transparent;
+                                border-width: root.fallback-private ? 0 : 1px;
+                                border-color: SC.border;
+                                Text {
+                                    text: "Private";
+                                    font-size: 11px;
+                                    font-weight: root.fallback-private ? 600 : 400;
+                                    color: root.fallback-private ? SC.private-text : SC.tertiary;
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.fallback-private-toggled(); }
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            VerticalLayout {
-                padding: 10px;
-                // a VerticalLayout-based child (which every *Tab component is) doesn't stretch
-                // to fill available width when nested inside a HorizontalLayout - horizontal-
-                // stretch alone doesn't fix it, reproduced down to the simplest case of a bare
-                // HorizontalLayout wrapping a single VerticalLayout child. Computing the width
-                // explicitly sidesteps the whole stretch-across-a-perpendicular-layout quirk.
-                width: root.width - sidebar.width;
+            // ============================================================ General
+            if root.page == 2: Rectangle {
+                general-header := PageHeader {
+                    y: 0;
+                    title: "General";
+                }
 
-                if root.current-tab == SettingsTab.general: GeneralTab {
-                    show-hotkeys: root.show-hotkeys;
-                    quit-on-lost-focus: root.quit-on-lost-focus;
-                    show-quit-on-lost-focus: root.show-quit-on-lost-focus;
-                    unwrap-urls: root.unwrap-urls;
-                    restorable-app-profiles: root.restorable-app-profiles;
-                    show-hotkeys-changed(v) => { root.show-hotkeys-changed(v); }
-                    quit-on-lost-focus-changed(v) => { root.quit-on-lost-focus-changed(v); }
-                    unwrap-urls-changed(v) => { root.unwrap-urls-changed(v); }
-                    restore-profile(id) => { root.restore-profile(id); }
+                ScrollView {
+                    y: general-header.height;
+                    height: parent.height - general-header.height;
+                    content-width: self.visible-width;
+                    content-height: general-content.preferred-height + 32px;
+
+                    general-content := VerticalLayout {
+                        x: 20px;
+                        y: 16px;
+                        width: parent.visible-width - 40px;
+                        spacing: 8px;
+                        alignment: start;
+
+                        SectionLabel {
+                            text: "APPEARANCE";
+                        }
+                        CardBox {
+                            height: 52px;
+                            Text {
+                                x: 14px;
+                                y: (parent.height - self.height) / 2;
+                                text: "Theme";
+                                font-size: 13px;
+                                color: SC.text;
+                            }
+                            // segmented control
+                            Rectangle {
+                                x: parent.width - self.width - 14px;
+                                y: (parent.height - self.height) / 2;
+                                width: 3 * 72px + 4px;
+                                height: 28px;
+                                border-radius: 7px;
+                                background: SC.field;
+                                for choice[i] in [
+                                    { label: "Auto", value: ThemeChoice.auto },
+                                    { label: "Light", value: ThemeChoice.light },
+                                    { label: "Dark", value: ThemeChoice.dark },
+                                ]: Rectangle {
+                                    x: 2px + i * 72px;
+                                    y: 2px;
+                                    width: 72px;
+                                    height: 24px;
+                                    border-radius: 5px;
+                                    property <bool> selected: root.theme == choice.value;
+                                    background: selected ? SC.raised : transparent;
+                                    drop-shadow-blur: selected ? 2px : 0;
+                                    drop-shadow-color: #00000026;
+                                    accessible-role: radio-button;
+                                    accessible-label: choice.label;
+                                    accessible-checked: selected;
+                                    accessible-action-default => { root.theme-changed(choice.value); }
+                                    Text {
+                                        text: choice.label;
+                                        font-size: 12px;
+                                        font-weight: selected ? 500 : 400;
+                                        color: selected ? SC.text : SC.secondary;
+                                    }
+                                    TouchArea {
+                                        clicked => { root.theme-changed(choice.value); }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 6px; }
+                        SectionLabel {
+                            text: "POPUP";
+                        }
+                        CardBox {
+                            height: popup-rows.preferred-height;
+                            popup-rows := VerticalLayout {
+                                SettingRow {
+                                    title: "Show hotkey numbers";
+                                    helper: "Press 1–9 in the popup to open the matching app.";
+                                    checked: root.show-hotkeys;
+                                    toggled(v) => { root.show-hotkeys-changed(v); }
+                                }
+                                if root.show-quit-on-lost-focus: SettingRow {
+                                    title: "Close when clicking elsewhere";
+                                    helper: "The popup goes away as soon as another window takes focus.";
+                                    checked: root.quit-on-lost-focus;
+                                    toggled(v) => { root.quit-on-lost-focus-changed(v); }
+                                }
+                                SettingRow {
+                                    title: "Unwrap tracking links";
+                                    helper: "Opens the real destination of Outlook Safe Links and Messenger links.";
+                                    checked: root.unwrap-urls;
+                                    last: true;
+                                    toggled(v) => { root.unwrap-urls-changed(v); }
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 6px; }
+                        SectionLabel {
+                            text: "PERFORMANCE";
+                        }
+                        CardBox {
+                            height: 58px;
+                            SettingRow {
+                                title: "Keep running in the background";
+                                helper: "Opens links instantly. Uses a little memory while idle.";
+                                checked: root.run-in-background;
+                                last: true;
+                                toggled(v) => { root.run-in-background-changed(v); }
+                            }
+                        }
+                    }
                 }
-                if root.current-tab == SettingsTab.appearance: AppearanceTab {
-                    theme: root.theme;
-                    theme-changed(t) => { root.theme-changed(t); }
+            }
+
+            // ============================================================ About
+            if root.page == 3: Rectangle {
+                about-header := PageHeader {
+                    y: 0;
+                    title: "About";
                 }
-                if root.current-tab == SettingsTab.rules: RulesTab {
-                    rules: root.rules;
-                    default-rule: root.default-rule;
-                    browsers: root.browsers;
-                    profile-picker-options: root.profile-picker-options;
-                    add-rule => { root.add-rule(); }
-                    remove-rule(i) => { root.remove-rule(i); }
-                    url-changed(i, t) => { root.rule-url-changed(i, t); }
-                    profile-changed(i, id) => { root.rule-profile-changed(i, id); }
-                    incognito-changed(i, v) => { root.rule-incognito-changed(i, v); }
-                }
-                if root.current-tab == SettingsTab.advanced: AdvancedTab {
-                    directories: root.directories;
-                    set-default => { root.set-default-browser(); }
-                    refresh => { root.refresh(); }
+                VerticalLayout {
+                    y: about-header.height;
+                    height: parent.height - about-header.height;
+                    padding: 24px;
+                    spacing: 8px;
+                    alignment: start;
+
+                    HorizontalLayout {
+                        spacing: 16px;
+                        alignment: start;
+                        Image {
+                            source: root.app-icon;
+                            width: 64px;
+                            height: 64px;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            Text {
+                                text: "Browsers";
+                                font-size: 18px;
+                                font-weight: 700;
+                                color: SC.text;
+                            }
+                            TextInput {
+                                text: root.version-text;
+                                font-size: 12px;
+                                color: SC.secondary;
+                                read-only: true;
+                            }
+                            Text {
+                                text: "© 2022-2024 Browsers.software team.";
+                                font-size: 11px;
+                                color: SC.secondary;
+                            }
+                        }
+                    }
+
+                    StyledText {
+                        text: @markdown("Visit us at [https://browsers.software](https://browsers.software).");
+                        default-font-size: 12px;
+                        default-color: SC.text;
+                        link-color: SC.accent-text;
+                        link-clicked(link) => { Platform.open-url(link); }
+                    }
+
+                    Rectangle { height: 8px; }
+                    SectionLabel {
+                        text: "FOLDERS";
+                    }
+                    DirectoriesList {
+                        directories: root.directories;
+                        entry-font-size: 11px;
+                        entry-color: SC.text;
+                    }
+
+                    Rectangle { height: 8px; }
+                    // Required attribution for Slint's Royalty-free license -
+                    // see https://slint.dev/legal/licensing. Do not remove.
+                    HorizontalLayout {
+                        alignment: start;
+                        AboutSlint {
+                            width: 220px;
+                        }
+                    }
                 }
             }
         }
