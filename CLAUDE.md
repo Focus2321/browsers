@@ -1,5 +1,11 @@
 # Notes for Claude
 
+## Local dev
+
+See DEVELOPING.md. Debug builds use bundle id `software.Browsers.dev` with separate
+config/cache/logs dirs; release builds use `software.Browsers`. Use the `make` targets
+(`make run`, `make dev`, `make install`) instead of hand-assembling .app bundles.
+
 ## Code Style
 
 ### Comments

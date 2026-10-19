@@ -385,7 +385,7 @@ pub fn get_bundle_ids_for_url_scheme(scheme: &str) -> Vec<String> {
 }
 
 pub fn set_default_web_browser() -> bool {
-    let bundle_id = "software.Browsers";
+    let bundle_id = crate::macos::macos_utils::APP_BUNDLE_ID;
     let bundle_id = NSString::from_str(bundle_id);
     let bundle_id = bundle_id.deref();
 
@@ -404,7 +404,7 @@ pub fn set_default_web_browser() -> bool {
 }
 
 pub fn is_default_web_browser() -> bool {
-    let bundle_id = "software.Browsers";
+    let bundle_id = crate::macos::macos_utils::APP_BUNDLE_ID;
     //let bundle_id = NSString::from_str(bundle_id);
     //let bundle_id = bundle_id.deref();
 

@@ -7,8 +7,19 @@ use crate::browser_repository::SupportedAppRepository;
 use crate::macos::macos_native;
 use crate::{InstalledBrowser, macos};
 
-const APP_DIR_NAME: &'static str = "software.Browsers";
-const APP_BUNDLE_ID: &'static str = "software.Browsers";
+// bundle id of the installed release build
+pub const RELEASE_BUNDLE_ID: &'static str = "software.Browsers";
+
+// debug builds get their own bundle id, so a dev build never shares config, cache, logs or
+// default browser registration with the installed release build (see Makefile)
+pub const DEV_BUNDLE_ID: &'static str = "software.Browsers.dev";
+
+#[cfg(not(debug_assertions))]
+pub const APP_BUNDLE_ID: &'static str = RELEASE_BUNDLE_ID;
+#[cfg(debug_assertions)]
+pub const APP_BUNDLE_ID: &'static str = DEV_BUNDLE_ID;
+
+const APP_DIR_NAME: &'static str = APP_BUNDLE_ID;
 
 /// get macOS application support directory for this app, supports sandboxing
 pub fn get_this_app_support_dir() -> PathBuf {
@@ -127,8 +138,8 @@ impl OsHelper {
         icons_root_dir: &Path,
         restricted_domain_patterns: Vec<String>,
     ) -> Option<InstalledBrowser> {
-        if bundle_id == "software.Browsers" {
-            // this is us, skip
+        if bundle_id == RELEASE_BUNDLE_ID || bundle_id == DEV_BUNDLE_ID {
+            // this is us (or the other build of us), skip
             return None;
         }
 

@@ -129,8 +129,9 @@ pub fn get_repository_basedir() -> PathBuf {
 
 pub fn get_resources_basedir() -> PathBuf {
     #[cfg(debug_assertions)]
-    // if running Browsers in debug mode
-    return PathBuf::from("./resources");
+    // if running Browsers in debug mode, read resources straight from the repo, so it works
+    // regardless of the working directory (e.g the dev .app bundle launched by macOS)
+    return PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
 
     #[cfg(target_os = "macos")]
     // /Applications/Browsers.app/Contents/Resources/
