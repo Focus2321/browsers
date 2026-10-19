@@ -1,51 +1,40 @@
-use std::cmp;
-
-use slint::Image;
+use slint::{Color, Image};
+use url::Url;
 
 use crate::gui::app_state::UIBrowser;
 use crate::gui::generated::{BrowserItem, RestorableProfile};
 use crate::gui::icon_loader::IconLoader;
 use crate::gui::screen::{Point, Rect};
 
-const WINDOW_BORDER_WIDTH: f32 = 1.0;
-const PADDING_X: f32 = 5.0;
-const PADDING_Y: f32 = 10.0;
-const ITEM_WIDTH: f32 = 210.0;
+// most rows the popup shows before the list starts scrolling
+const MAX_VISIBLE_ROWS: usize = 10;
 
 // icon styles are conventionally different on platforms,
 // e.g most macos icons are actually with a lot of padding
 pub fn get_icon_size() -> f32 {
     if cfg!(target_os = "macos") {
-        32.0
+        28.0
     } else {
-        24.0
+        22.0
     }
 }
 
 fn calculate_visible_browser_count(browsers_total: usize) -> usize {
-    // max 6 items without scrollbar
-    let item_count = cmp::min(6, browsers_total);
-    // but at least 1 item in case of errors (or window size is too small)
-    cmp::max(1, item_count)
+    // at least 1 row, so an empty filter result still has room for its "No matches" line
+    browsers_total.clamp(1, MAX_VISIBLE_ROWS)
 }
 
-fn visible_scroll_area_height(browsers_count_f32: f32, row_height: f32) -> f32 {
-    browsers_count_f32 * row_height
-}
-
-// row_height comes from ui/common.slint's Layout.browser-row-height, the single source of truth
-// also used for the row layout, keyboard-scroll, and drag-drop math in main_window.slint
-pub fn recalculate_window_size(browser_count: usize, row_height: f32) -> (f32, f32) {
-    let item_count = calculate_visible_browser_count(browser_count);
-    calculate_window_size(item_count, row_height)
-}
-
-fn calculate_window_size(item_count: usize, row_height: f32) -> (f32, f32) {
-    let browsers_count_f32 = item_count as f32;
-    let window_width = ITEM_WIDTH + PADDING_X * 2.0 + WINDOW_BORDER_WIDTH * 2.0;
-    let visible_scroll_area_height = visible_scroll_area_height(browsers_count_f32, row_height);
-    let window_height = visible_scroll_area_height + 5.0 + 12.0 + PADDING_Y * 2.0 + 10.0;
-    (window_width, window_height)
+// window size for the given number of (filtered) rows, so the height always fits whole rows.
+// row_height and chrome_height (header, action bar, paddings) come from main_window.slint, the
+// single source of truth for the popup's layout
+pub fn recalculate_window_size(
+    browser_count: usize,
+    row_height: f32,
+    chrome_height: f32,
+    width: f32,
+) -> (f32, f32) {
+    let row_count = calculate_visible_browser_count(browser_count) as f32;
+    (width, chrome_height + row_count * row_height)
 }
 
 pub fn calculate_window_position(
@@ -102,29 +91,203 @@ pub fn browser_item(
         is_last: b.is_last,
         has_priority_ordering: b.has_priority_ordering(),
         supports_profiles: b.supports_profiles,
+        profile_initial: profile_initial(&b.profile_name).into(),
+        avatar_color: avatar_color(&b.unique_id),
     }
 }
 
-pub fn to_browser_item(b: &UIBrowser, icons: &mut IconLoader, show_hotkeys: bool) -> BrowserItem {
-    let show_hotkey = show_hotkeys && b.filtered_index < 9;
+// `position` is the row's place in the list as shown, which is what the 1-9 hotkeys and the
+// keyboard selection follow (it differs from filtered_index once type-to-filter narrows the list)
+pub fn to_browser_item(
+    b: &UIBrowser,
+    position: usize,
+    icons: &mut IconLoader,
+    show_hotkeys: bool,
+) -> BrowserItem {
+    let show_hotkey = show_hotkeys && position < 9;
     let hotkey = if show_hotkey {
-        (b.filtered_index + 1).to_string()
+        (position + 1).to_string()
     } else {
         String::new()
     };
 
-    browser_item(
+    let mut item = browser_item(
         b,
         icons.load(&b.icon_path),
         icons.load(&b.profile_icon_path),
         hotkey,
         show_hotkey,
-    )
+    );
+    item.filtered_index = position as i32;
+    item
 }
 
 pub fn to_restorable_profile(b: &UIBrowser) -> RestorableProfile {
     RestorableProfile {
         unique_id: b.unique_id.clone().into(),
         full_name: b.get_full_name().into(),
+    }
+}
+
+// first letter of the profile name, for the colored circle shown when a profile has no picture
+fn profile_initial(profile_name: &str) -> String {
+    profile_name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_default()
+}
+
+// picks a stable color per profile, so the same profile keeps its color across launches
+fn avatar_color(unique_id: &str) -> Color {
+    const COLORS: [(u8, u8, u8); 8] = [
+        (0x7c, 0x5c, 0xe6), // violet
+        (0xd9, 0x66, 0x3a), // orange
+        (0x3e, 0x9d, 0x68), // green
+        (0x2f, 0x7f, 0xd8), // blue
+        (0xc9, 0x4a, 0x8a), // pink
+        (0x1f, 0x9a, 0x9a), // teal
+        (0xc2, 0x4b, 0x4b), // red
+        (0xa0, 0x7a, 0x2c), // ochre
+    ];
+    // FNV-1a - std's DefaultHasher isn't guaranteed to be stable between Rust releases
+    let hash = unique_id
+        .bytes()
+        .fold(0x811c_9dc5_u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193));
+    let (r, g, b) = COLORS[hash as usize % COLORS.len()];
+    Color::from_rgb_u8(r, g, b)
+}
+
+// type-to-filter: keeps the browsers whose profile or app name contains the query, ignoring case
+pub fn matches_filter(b: &UIBrowser, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let profile_name = if b.supports_profiles {
+        b.profile_name.as_str()
+    } else {
+        ""
+    };
+    [b.browser_name.as_str(), profile_name]
+        .iter()
+        .any(|name| name.to_lowercase().contains(&query))
+}
+
+// applies one key press to the filter text - see edit-filter in main_window.slint.
+// digits are left alone, those stay the 1-9 hotkeys.
+pub fn edit_filter(current: &str, key: &str) -> String {
+    const BACKSPACE: &str = "\u{8}";
+    const DELETE: &str = "\u{7f}";
+    if key == BACKSPACE || key == DELETE {
+        let mut text = current.to_string();
+        text.pop();
+        return text;
+    }
+    // Slint encodes arrows, function keys and other special keys as control characters or
+    // private-use codepoints (U+F700..U+F8FF), neither of which is something the user typed
+    let is_typed_text = !key.is_empty()
+        && key.chars().all(|c| {
+            !c.is_control() && !('\u{f700}'..='\u{f8ff}').contains(&c) && !c.is_ascii_digit()
+        });
+    if is_typed_text {
+        format!("{current}{key}")
+    } else {
+        current.to_string()
+    }
+}
+
+// splits a link into the header's two lines: "github.com" and "/slint-ui/slint/pull/123".
+// anything that doesn't parse as a url with a host goes on the second line as-is
+pub fn split_url_for_header(url: &str) -> (String, String) {
+    match Url::parse(url) {
+        Ok(parsed) if parsed.host_str().is_some() => {
+            let domain = parsed.host_str().unwrap_or_default().to_string();
+            let mut rest = parsed.path().to_string();
+            if rest == "/" {
+                rest.clear();
+            }
+            if let Some(query) = parsed.query() {
+                rest.push('?');
+                rest.push_str(query);
+            }
+            if let Some(fragment) = parsed.fragment() {
+                rest.push('#');
+                rest.push_str(fragment);
+            }
+            (domain, rest)
+        }
+        _ => (String::new(), url.to_string()),
+    }
+}
+
+// display name ("Slack") of the app with the given bundle id ("com.tinyspeck.slackmacgap"), for
+// the header's "from Slack"
+#[cfg(target_os = "macos")]
+pub fn source_app_name(bundle_id: &str) -> String {
+    if bundle_id.is_empty() {
+        return String::new();
+    }
+    crate::macos::macos_native::get_bundle_url(bundle_id)
+        .and_then(|path| {
+            std::path::Path::new(&path.to_string())
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn source_app_name(_bundle_id: &str) -> String {
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_window_height_fits_rows() {
+        assert_eq!(recalculate_window_size(3, 40.0, 94.0, 300.0), (300.0, 214.0));
+        // empty list still keeps one row for the "No matches" line
+        assert_eq!(recalculate_window_size(0, 40.0, 94.0, 300.0), (300.0, 134.0));
+        // scrolls after 10 rows
+        assert_eq!(recalculate_window_size(25, 40.0, 94.0, 300.0), (300.0, 494.0));
+    }
+
+    #[test]
+    fn test_edit_filter() {
+        assert_eq!(edit_filter("wo", "r"), "wor");
+        assert_eq!(edit_filter("wo", "R"), "woR");
+        assert_eq!(edit_filter("wo", "\u{8}"), "w");
+        assert_eq!(edit_filter("", "\u{8}"), "");
+        assert_eq!(edit_filter("wo", "1"), "wo");
+        assert_eq!(edit_filter("wo", "\u{f700}"), "wo");
+        assert_eq!(edit_filter("wo", "\u{1b}"), "wo");
+        assert_eq!(edit_filter("wo", ""), "wo");
+        assert_eq!(edit_filter("my", " "), "my ");
+    }
+
+    #[test]
+    fn test_split_url_for_header() {
+        assert_eq!(
+            split_url_for_header("https://github.com/slint-ui/slint/pull/123?a=b#c"),
+            (
+                "github.com".to_string(),
+                "/slint-ui/slint/pull/123?a=b#c".to_string()
+            )
+        );
+        assert_eq!(
+            split_url_for_header("https://example.com/"),
+            ("example.com".to_string(), String::new())
+        );
+        assert_eq!(split_url_for_header(""), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn test_profile_initial() {
+        assert_eq!(profile_initial("work"), "W");
+        assert_eq!(profile_initial("  (Default)"), "D");
+        assert_eq!(profile_initial(""), "");
     }
 }
