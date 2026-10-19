@@ -348,9 +348,16 @@ fn wire_main_window(state: &SharedState) {
                 target_index
             };
 
-            let _ = sender.send(MessageToMain::MoveAppProfile(
-                payload.unique_id.clone(),
-                MoveTo::ToIndex(final_index),
+            // target_index is a position in the url-filtered list, so resolve it to an id here
+            // instead of sending an index that main would apply to the unfiltered list
+            let before = state
+                .borrow()
+                .filtered_browsers
+                .get(target_index)
+                .map(|b| b.unique_id.clone());
+            let _ = sender.send(MessageToMain::MoveAppProfilesBefore(
+                vec![payload.unique_id.clone()],
+                before,
             ));
 
             win.set_focused_index(final_index as i32);
@@ -457,6 +464,28 @@ impl UiHandle {
         self.with_state(move |state| {
             state.borrow_mut().restorable_app_profiles = hidden;
             refresh_main_window_model(state);
+        });
+    }
+
+    // visible + hidden profiles and the saved order in one go, so the popup and Settings
+    // always update together after a hide/restore/move/rescan
+    pub fn profiles_received(
+        &self,
+        browsers: Vec<UIBrowser>,
+        hidden: Vec<UIBrowser>,
+        profile_order: Vec<String>,
+    ) {
+        self.with_state(move |state| {
+            {
+                let mut st = state.borrow_mut();
+                st.browsers = browsers;
+                st.filtered_browsers = get_filtered_browsers(&st.url, &st.browsers);
+                st.restorable_app_profiles = hidden;
+                st.ui_settings.profile_order = profile_order;
+            }
+            refresh_main_window_model(state);
+            resize_main_window(state);
+            settings_window::refresh(state);
         });
     }
 

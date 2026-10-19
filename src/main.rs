@@ -164,7 +164,10 @@ fn main() {
                 .ui_settings
                 .behavioral_settings
                 .unwrap_urls;
-            let behavioral_config = utils::BehavioralConfig { unwrap_urls };
+            let behavioral_config = utils::BehavioralConfig {
+                unwrap_urls,
+                ..Default::default()
+            };
             let _ = open_urls_sender.send(MessageToMain::UrlPassedToMain(
                 sender_bundle_id.unwrap_or_default(),
                 url,
