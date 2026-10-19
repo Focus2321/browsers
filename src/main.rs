@@ -15,11 +15,14 @@ use browsers::gui::app::UiHandle;
 use browsers::utils::OSAppFinder;
 use browsers::{
     MessageToMain, UrlOpenContext, generate_all_browser_profiles, get_opening_rules,
-    open_link_if_matching_rule, prepare_ui, print_visible_options, unwrap_url, utils,
+    load_installed_browsers, open_link_if_matching_rule, prepare_ui, print_visible_options,
+    unwrap_url, utils,
 };
 use browsers::{handle_messages_to_main, paths};
 
 fn main() {
+    app::record_launch_time();
+
     // prefer Skia over Slint's default femtovg on macOS - femtovg's lack of font hinting causes
     // small-text artifacts, Skia delegates to CoreText instead (see Cargo.toml for why it's
     // macOS-only).
@@ -100,8 +103,11 @@ fn main() {
     let config = app_finder.load_config();
     let mut opening_rules_and_default_profile = get_opening_rules(&config);
 
+    // the cached list keeps startup fast, the message handler rescans in the background if so
+    let (installed_browsers, installed_browsers_from_cache) =
+        load_installed_browsers(&app_finder, force_reload);
     let mut visible_and_hidden_profiles =
-        generate_all_browser_profiles(&config, &app_finder, force_reload);
+        generate_all_browser_profiles(&config, &app_finder, &installed_browsers);
 
     let behavioral_settings = config.get_behavior();
     // TODO: url should not be considered here in case of macos
@@ -150,21 +156,29 @@ fn main() {
     if let Some(bridge) = &bridge {
         let resign_active_state = state.clone();
         bridge.set_resign_active_handler(move || {
-            let quits = resign_active_state.borrow().quit_on_lost_focus_applies();
-            if quits {
-                std::process::exit(browsers::QUIT_EXIT_CODE);
+            let (applies, popup_visible) = {
+                let st = resign_active_state.borrow();
+                (st.quit_on_lost_focus_applies(), st.popup_visible())
+            };
+            // hiding the app ourselves (see app::hide_popup) resigns active too
+            if applies && popup_visible {
+                app::dismiss_popup(&resign_active_state);
             }
         });
 
         let open_urls_sender = main_sender.clone();
         let open_urls_state = state.clone();
         bridge.set_open_urls_handler(move |sender_bundle_id, url| {
-            let unwrap_urls = open_urls_state
+            let behavioral_settings = open_urls_state
                 .borrow()
                 .ui_settings
                 .behavioral_settings
-                .unwrap_urls;
-            let behavioral_config = utils::BehavioralConfig { unwrap_urls };
+                .clone();
+            let behavioral_config = utils::BehavioralConfig {
+                unwrap_urls: behavioral_settings.unwrap_urls,
+                run_in_background: behavioral_settings.run_in_background,
+            };
+            tracing::debug!("GetURL event received");
             let _ = open_urls_sender.send(MessageToMain::UrlPassedToMain(
                 sender_bundle_id.unwrap_or_default(),
                 url,
@@ -174,12 +188,16 @@ fn main() {
     }
 
     let ui_handle = UiHandle::new(&state);
+    let handler_sender = main_sender.clone();
     thread::spawn(move || {
         handle_messages_to_main(
             main_receiver,
+            handler_sender,
             ui_handle,
             &mut opening_rules_and_default_profile,
             &mut visible_and_hidden_profiles,
+            installed_browsers,
+            installed_browsers_from_cache,
             &app_finder,
         );
     });
@@ -191,5 +209,20 @@ fn main() {
         browsers::gui::about_window::open(&state);
     }
 
-    app::run(&state);
+    // when macOS launches the app for a link, the URL arrives as an apple event once the event
+    // loop runs, rather than on the command line.
+    // Waiting for it lets opening rules handle it before any popup shows up.
+    let await_url = cfg!(target_os = "macos") && cleaned_url.is_empty();
+
+    #[cfg(target_os = "macos")]
+    if let Some(bridge) = bridge {
+        let reopen_state = state.clone();
+        slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+            bridge.set_reopen_handler(move || app::reopen(&reopen_state));
+            // the handler (and the GetURL one) live in the bridge, which has to outlive the app
+            std::mem::forget(bridge);
+        });
+    }
+
+    app::run(&state, await_url);
 }

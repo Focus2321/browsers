@@ -1,14 +1,11 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 
 use configparser::ini::{Ini, IniDefault};
 use naive_cityhash::cityhash64;
-use serde_json::Value;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::InstalledBrowserProfile;
+use crate::{InstalledBrowserProfile, utils};
 
 pub fn find_firefox_profiles(
     firefox_profiles_dir: &Path,
@@ -42,8 +39,16 @@ pub fn find_firefox_profiles(
     ini_default.case_sensitive = true;
     let mut profiles_ini_config = Ini::new_from_defaults(ini_default);
 
-    // You can easily load a file to get a clone of the map:
-    let profiles_ini_map = profiles_ini_config.load(&profiles_ini_path).unwrap();
+    // You can easily load a file to get a clone of the map.
+    // Unreadable (e.g denied by macOS App Data protection) means "no profiles", so Firefox still
+    // shows up with its placeholder profile.
+    let profiles_ini_map = match profiles_ini_config.load(&profiles_ini_path) {
+        Ok(profiles_ini_map) => profiles_ini_map,
+        Err(err) => {
+            warn!("Could not read {}: {}", profiles_ini_path.display(), err);
+            return browser_profiles;
+        }
+    };
     //info!("{:?}", map);
     // You can also safely not store the reference and access it later with get_map_ref() or get a clone with get_map()
 
@@ -99,7 +104,13 @@ pub fn find_firefox_profiles(
         }
     }
 
-    let profiles_ini_map = profiles_ini_config.load(&profiles_ini_path).unwrap();
+    let profiles_ini_map = match profiles_ini_config.load(&profiles_ini_path) {
+        Ok(profiles_ini_map) => profiles_ini_map,
+        Err(err) => {
+            warn!("Could not read {}: {}", profiles_ini_path.display(), err);
+            return browser_profiles;
+        }
+    };
     for (_profile_key, profile_values) in profiles_ini_map.into_iter() {
         if !profile_values.contains_key("Path") {
             continue;
@@ -175,7 +186,9 @@ pub fn find_firefox_profiles(
             .and_then(|a| a.as_ref())
             .map(|b| b.to_string());
 
-        let profile_name = name_maybe.unwrap();
+        let Some(profile_name) = name_maybe else {
+            continue;
+        };
 
         // Even if profile has containers, also add a non-container option
         browser_profiles.push(InstalledBrowserProfile {
@@ -207,18 +220,18 @@ fn has_open_url_in_container_extension_installed(extensions_json_file_path: &Pat
     let extension_id = "{f069aec0-43c5-4bbf-b6b4-df95c4326b98}";
     let extension2_id = "openincontainer@browsers.software";
 
-    // Open the file in read-only mode with buffer.
-    let file = File::open(extensions_json_file_path).unwrap();
-    let reader = BufReader::new(file);
-    let v: Value = serde_json::from_reader(reader).unwrap();
-    let addons = &v["addons"];
-    let addons_arr = addons.as_array().unwrap();
+    let Some(v) = utils::read_json_file(extensions_json_file_path) else {
+        return false;
+    };
+    let Some(addons_arr) = v["addons"].as_array() else {
+        return false;
+    };
     for addon in addons_arr {
-        let addon_id = addon["id"].as_str().unwrap();
+        let addon_id = addon["id"].as_str().unwrap_or("");
         // https://addons.mozilla.org/en-US/firefox/addon/open-url-in-container/
 
         if addon_id == extension_id || addon_id == extension2_id {
-            let is_active = addon["active"].as_bool().unwrap();
+            let is_active = addon["active"].as_bool().unwrap_or(false);
             return is_active;
         }
     }
@@ -227,17 +240,17 @@ fn has_open_url_in_container_extension_installed(extensions_json_file_path: &Pat
 }
 
 fn containers_json_map(containers_json_file_path: &Path) -> Vec<FirefoxContainer> {
-    // Open the file in read-only mode with buffer.
-    let file = File::open(containers_json_file_path).unwrap();
-    let reader = BufReader::new(file);
-    let v: Value = serde_json::from_reader(reader).unwrap();
-    let identities = &v["identities"];
-    let identities_arr = identities.as_array().unwrap();
-
     let mut containers: Vec<FirefoxContainer> = Vec::new();
 
+    let Some(v) = utils::read_json_file(containers_json_file_path) else {
+        return containers;
+    };
+    let Some(identities_arr) = v["identities"].as_array() else {
+        return containers;
+    };
+
     for identity in identities_arr {
-        let is_public = identity["public"].as_bool().unwrap();
+        let is_public = identity["public"].as_bool().unwrap_or(false);
         if is_public {
             let name = if let Some(l10n_id) = identity["l10nID"].as_str() {
                 // old ones

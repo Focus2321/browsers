@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Redesigned link picker: wider rows that show the profile first, the link's domain/path and source app, type-to-filter, Shift for private windows, and a right-click "Always open <site> here"
+- Redesigned Settings with Browsers, Rules, General and About pages: drag to reorder, show/hide in place, profiles grouped by browser, and an offer to hide apps that aren't browsers
+- Rules page: "Test a link", drag to reorder rules, new rules stay drafts until complete, hidden profiles can be rule targets
+- macOS: "Keep running in the background" (on by default) shows the picker instantly for every link after the first
+
+### Fixed
+
+- macOS: Fix a crash during app discovery when macOS blocks reading Chrome/Brave profile data, which also made every launch rescan all apps (2–3 s)
+- macOS: Opening rules, the default profile and the Safari workaround work again (the URL now arrives before the picker is shown)
+- Faster app discovery: smaller icons are only rendered when stale, without running `codesign` per app, and the app list is cached and refreshed in the background
+- Reordering apps put them in the wrong place when some apps were hidden
+- Refresh/Rescan didn't update the list
+
 ## [0.8.0] - 2026-10-09
 
 ### Added

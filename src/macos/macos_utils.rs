@@ -1,14 +1,24 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::browser_repository::SupportedAppRepository;
 use crate::macos::macos_native;
 use crate::{InstalledBrowser, macos};
 
-const APP_DIR_NAME: &'static str = "software.Browsers";
-const APP_BUNDLE_ID: &'static str = "software.Browsers";
+// bundle id of the installed release build
+pub const RELEASE_BUNDLE_ID: &'static str = "software.Browsers";
+
+// debug builds get their own bundle id, so a dev build never shares config, cache, logs or
+// default browser registration with the installed release build (see Makefile)
+pub const DEV_BUNDLE_ID: &'static str = "software.Browsers.dev";
+
+#[cfg(not(debug_assertions))]
+pub const APP_BUNDLE_ID: &'static str = RELEASE_BUNDLE_ID;
+#[cfg(debug_assertions)]
+pub const APP_BUNDLE_ID: &'static str = DEV_BUNDLE_ID;
+
+const APP_DIR_NAME: &'static str = APP_BUNDLE_ID;
 
 /// get macOS application support directory for this app, supports sandboxing
 pub fn get_this_app_support_dir() -> PathBuf {
@@ -37,27 +47,23 @@ pub fn macos_get_sandboxed_home_dir(app_id: &str) -> PathBuf {
         .join("Data")
 }
 
-// bundle_path e.g "/Applications/Slack.app"
-fn has_sandbox_entitlement(bundle_path: &str) -> bool {
-    let mut command = Command::new("codesign");
-    command
-        .arg("-d")
-        .arg("--entitlements")
-        .arg("-")
-        .arg("--xml")
-        .arg(bundle_path);
+// whether the icon png cached at icon_path is still current for the app at bundle_path -
+// app updates replace the bundle, which bumps the modification time of the bundle directory or
+// at least of its Info.plist
+fn is_icon_fresh(icon_path: &Path, bundle_path: &Path) -> bool {
+    let modified = |path: &Path| fs::metadata(path).and_then(|m| m.modified()).ok();
 
-    let result = command.output();
-    if result.is_err() {
-        warn!("Could not check if app is sandboxed or not, defaulting to not");
+    let Some(icon_modified) = modified(icon_path) else {
         return false;
-    }
-    let output = result.unwrap();
-    let stdout = output.stdout;
-    let cow = String::from_utf8_lossy(&stdout);
-    let search = "<key>com.apple.security.app-sandbox</key><true/>";
-
-    return cow.contains(search);
+    };
+    let app_modified = [
+        modified(bundle_path),
+        modified(&bundle_path.join("Contents").join("Info.plist")),
+    ];
+    app_modified
+        .into_iter()
+        .flatten()
+        .all(|app_modified| app_modified <= icon_modified)
 }
 
 pub struct OsHelper {
@@ -86,7 +92,7 @@ impl OsHelper {
     ) -> Vec<InstalledBrowser> {
         let mut browsers: Vec<InstalledBrowser> = Vec::new();
 
-        let cache_root_dir = get_this_app_cache_root_dir();
+        let cache_root_dir = crate::paths::get_cache_root_dir();
         let icons_root_dir = cache_root_dir.join("icons");
         fs::create_dir_all(icons_root_dir.as_path()).unwrap();
 
@@ -127,8 +133,8 @@ impl OsHelper {
         icons_root_dir: &Path,
         restricted_domain_patterns: Vec<String>,
     ) -> Option<InstalledBrowser> {
-        if bundle_id == "software.Browsers" {
-            // this is us, skip
+        if bundle_id == RELEASE_BUNDLE_ID || bundle_id == DEV_BUNDLE_ID {
+            // this is us (or the other build of us), skip
             return None;
         }
 
@@ -150,13 +156,16 @@ impl OsHelper {
         let executable_path = PathBuf::from(executable_path);
 
         let icon_path_str = full_stored_icon_path.display().to_string();
-        macos_native::create_icon_for_app(&bundle_url, icon_path_str.as_str());
+        if !is_icon_fresh(&full_stored_icon_path, Path::new(&bundle_path)) {
+            macos_native::create_icon_for_app(&bundle_url, icon_path_str.as_str());
+        }
 
         let command_parts: Vec<String> = vec![executable_path.to_str().unwrap().to_string()];
 
-        // TODO: check if "com.apple.security.app-sandbox" entitlement exists for the app
-        // TODO: https://stackoverflow.com/questions/12177948/how-do-i-detect-if-my-app-is-sandboxed
-        let is_macos_sandbox = has_sandbox_entitlement(bundle_path.as_str());
+        // sandboxing only changes where the app keeps its profiles, so there's no point reading
+        // the code signature of apps we don't parse profiles for
+        let is_macos_sandbox = supported_app.has_profiles_parser()
+            && macos_native::is_app_sandboxed(bundle_path.as_str());
         let app_config_dir_abs = supported_app.get_app_config_dir_abs(false, is_macos_sandbox);
 
         let browser = InstalledBrowser {

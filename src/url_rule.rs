@@ -123,41 +123,60 @@ struct TargetUrl {
 
 // TODO: parse from the end to beginning
 fn extract_part_matchers(full_rule: &str) -> UrlMatcher {
-    // full_rule = https://hostname/path?query#fragment
-    //assert_eq!(s.find("pard"), Some(17));
-    let scheme_end_index = full_rule.find("://").expect("no scheme with :// suffix");
+    try_extract_part_matchers(full_rule).expect("rule is missing one of :// / ? #")
+}
+
+// full_rule = https://hostname/path?query#fragment
+fn try_extract_part_matchers(full_rule: &str) -> Option<UrlMatcher> {
+    let scheme_end_index = full_rule.find("://")?;
     // https
     let scheme_pattern = &full_rule[..scheme_end_index];
     // hostname/path?query#fragment
     let after_scheme = &full_rule[scheme_end_index + 3..];
 
-    let after_hostname_index = after_scheme.find("/").expect("no hostname with / suffix");
+    let after_hostname_index = after_scheme.find("/")?;
     // hostname
     let hostname_pattern = &after_scheme[..after_hostname_index];
     // /path?query#fragment
     let after_hostname = &after_scheme[after_hostname_index..];
 
-    let after_path_index = after_hostname.find("?").expect("no path with ? suffix");
+    let after_path_index = after_hostname.find("?")?;
     // /path
     let path_pattern = &after_hostname[..after_path_index];
     // query#fragment
     let after_path = &after_hostname[after_path_index + 1..];
 
-    let after_query_index = after_path.find("#").expect("no query with # suffix");
+    let after_query_index = after_path.find("#")?;
     // query
     let query_pattern = &after_path[..after_query_index];
     // fragment
-    let after_query = &after_path[after_query_index + 1..];
-    // fragment
-    let fragment_pattern = &after_query;
+    let fragment_pattern = &after_path[after_query_index + 1..];
 
-    return UrlMatcher {
+    Some(UrlMatcher {
         scheme: scheme_pattern.to_string(),
         hostname: hostname_pattern.to_string(),
         path: path_pattern.to_string(),
         query: query_pattern.to_string(),
         fragment: fragment_pattern.to_string(),
+    })
+}
+
+// whether to_url_matcher(rule).to_glob_matcher() would succeed - rules are typed by hand in
+// Settings, and a half-typed one (e.g. "github.com/[") would otherwise panic when matched
+pub fn is_valid_pattern(rule: &str) -> bool {
+    let rule = rule.trim();
+    if rule.is_empty() {
+        return false;
+    }
+    let Some(m) = try_extract_part_matchers(&transform_to_full_match(rule)) else {
+        return false;
     };
+    let hostname = m.hostname.replace(".", "/");
+    let query = m.query.replace("&", "/");
+    !hostname.is_empty()
+        && [m.scheme.as_str(), &hostname, &m.path, &query, &m.fragment]
+            .iter()
+            .all(|part| GlobBuilder::new(part).build().is_ok())
 }
 
 pub fn to_url_matcher(rule: &str) -> UrlMatcher {
@@ -216,6 +235,17 @@ fn add_fragment_matcher(rule: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_valid_pattern() {
+        assert!(is_valid_pattern("github.com/acme/**"));
+        assert!(is_valid_pattern("*.youtube.com"));
+        assert!(is_valid_pattern("https://linear.app/**"));
+        assert!(!is_valid_pattern(""));
+        assert!(!is_valid_pattern("github.com/["));
+        assert!(!is_valid_pattern("a?b"));
+        assert!(!is_valid_pattern("/just/a/path"));
+    }
 
     #[test]
     fn test_transform_hostname_to_full_match() {

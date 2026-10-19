@@ -4,7 +4,9 @@ use std::fmt::Debug;
 use std::process::{Command, exit};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 use url::form_urlencoded::Parse;
@@ -49,6 +51,7 @@ mod windows;
 
 mod chromium_profiles_parser;
 mod firefox_profiles_parser;
+mod profile_order;
 mod slack_profiles_parser;
 mod slack_url_parser;
 mod url_rule;
@@ -105,6 +108,11 @@ impl BrowserCommon {
     // used in configuration file to uniquely identify this app
     fn get_unique_app_id(&self) -> String {
         return self.executable_path.to_string();
+    }
+
+    // bundle id on macOS - what opening rules compare their source app against
+    fn get_app_id(&self) -> &str {
+        return self.supported_app.get_app_id();
     }
 
     fn has_real_profiles(&self) -> bool {
@@ -336,7 +344,7 @@ impl CommonBrowserProfile {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct InstalledBrowser {
     // In Linux:
     //  "env",
@@ -372,7 +380,7 @@ pub struct InstalledBrowser {
     restricted_domains: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct InstalledAppProfiles {
     pub(crate) profiles_type: InstalledAppProfilesType,
     pub(crate) profiles: Vec<InstalledBrowserProfile>,
@@ -414,7 +422,7 @@ enum InstalledAppProfilesType {
     PlaceholderProfiles,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct InstalledBrowserProfile {
     profile_cli_arg_value: String,
     profile_cli_container_name: Option<String>,
@@ -432,7 +440,7 @@ pub enum ProfileIcon {
     Name { name: String },
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OpeningRule {
     source_app: Option<String>,
     url_pattern: Option<String>,
@@ -456,14 +464,10 @@ impl OpeningRulesAndDefaultProfile {
         }
         let given_url = url_result.unwrap();
 
-        for r in &self.opening_rules {
-            let url_match = Self::url_matches(r, &given_url);
-            let source_app_match =
-                Self::source_app_matches(r, url_open_context.source_app_maybe.as_ref());
-
-            if url_match && source_app_match {
-                return r.opener.clone();
-            }
+        let source_app = url_open_context.source_app_maybe.as_ref();
+        if let Some(index) = Self::matching_rule_index(&self.opening_rules, &given_url, source_app)
+        {
+            return self.opening_rules[index].opener.clone();
         }
 
         if self.default_profile.is_some() {
@@ -473,8 +477,24 @@ impl OpeningRulesAndDefaultProfile {
         return None;
     }
 
+    // index of the first rule that matches both the url and the source app
+    fn matching_rule_index(
+        rules: &[OpeningRule],
+        given_url: &Url,
+        source_app: Option<&String>,
+    ) -> Option<usize> {
+        rules.iter().position(|r| {
+            Self::url_matches(r, given_url) && Self::source_app_matches(r, source_app)
+        })
+    }
+
     fn url_matches(r: &OpeningRule, given_url: &Url) -> bool {
         let url_match = if let Some(ref url_pattern) = r.url_pattern {
+            // url patterns are typed by hand, and the matcher panics on a broken pattern or on
+            // a url without a host (e.g. mailto:), so neither can ever match
+            if !url_rule::is_valid_pattern(url_pattern) || given_url.host_str().is_none() {
+                return false;
+            }
             let url_matches = url_rule::to_url_matcher(url_pattern.as_str())
                 .to_glob_matcher()
                 .url_matches(&given_url);
@@ -500,6 +520,69 @@ impl OpeningRulesAndDefaultProfile {
         }
 
         return source_app_match;
+    }
+}
+
+// what would happen to a link, as shown by "Test a link" in Settings
+#[derive(Debug, PartialEq)]
+pub enum RuleTestOutcome {
+    InvalidUrl,
+    // index into the rules passed to test_opening_rules
+    MatchedRule(usize),
+    DefaultProfile,
+    Picker,
+}
+
+// runs `url` (a missing scheme means https) coming from `source_app` through `rules` exactly like
+// an opened link would be, see get_rule_for_source_app_and_url.
+// Rules with nothing valid to match are skipped, but the returned index still points into
+// `rules`.
+pub fn test_opening_rules(
+    rules: &[UISettingsRule],
+    has_default_profile: bool,
+    url: &str,
+    source_app: Option<&str>,
+) -> RuleTestOutcome {
+    let url = url.trim();
+    let url = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{url}")
+    };
+    let Ok(given_url) = Url::from_str(url.as_str()) else {
+        return RuleTestOutcome::InvalidUrl;
+    };
+    if given_url.host_str().is_none_or(|host| host.is_empty()) {
+        return RuleTestOutcome::InvalidUrl;
+    }
+
+    let complete_rules: Vec<(usize, OpeningRule)> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.has_valid_matcher())
+        .map(|(i, r)| (i, ui_rule_to_opening_rule(r)))
+        .collect();
+    let opening_rules: Vec<OpeningRule> = complete_rules.iter().map(|(_, r)| r.clone()).collect();
+
+    let source_app = source_app.map(|s| s.to_string());
+    let matched = OpeningRulesAndDefaultProfile::matching_rule_index(
+        &opening_rules,
+        &given_url,
+        source_app.as_ref(),
+    );
+
+    match matched {
+        Some(index) => RuleTestOutcome::MatchedRule(complete_rules[index].0),
+        None if has_default_profile => RuleTestOutcome::DefaultProfile,
+        None => RuleTestOutcome::Picker,
+    }
+}
+
+fn ui_rule_to_opening_rule(ui_rule: &UISettingsRule) -> OpeningRule {
+    OpeningRule {
+        source_app: ui_rule.get_source_app(),
+        url_pattern: ui_rule.get_url_pattern().map(|p| p.trim().to_string()),
+        opener: map_as_profile_and_options(&ui_rule.opener),
     }
 }
 
@@ -555,13 +638,33 @@ fn to_opening_rules(config_rules: &Vec<ConfigRule>) -> Vec<OpeningRule> {
         .collect();
 }
 
+// returns the installed apps, and whether they came from the cache - in which case a background
+// rescan (see rescan_installed_browsers_in_background) should follow to pick up profile changes
+#[instrument(skip_all)]
+pub fn load_installed_browsers(
+    app_finder: &OSAppFinder,
+    force_reload: bool,
+) -> (Vec<InstalledBrowser>, bool) {
+    app_finder.get_installed_browsers_cached(force_reload)
+}
+
+// scans in a separate thread, so a cached list can be shown right away.
+// The result comes back as MessageToMain::InstalledBrowsersScanned.
+pub fn rescan_installed_browsers_in_background(main_sender: Sender<MessageToMain>) {
+    thread::spawn(move || {
+        let started = Instant::now();
+        let installed_browsers = OSAppFinder::new().rescan_installed_browsers();
+        debug!("Background rescan took {} ms", started.elapsed().as_millis());
+        let _ = main_sender.send(MessageToMain::InstalledBrowsersScanned(installed_browsers));
+    });
+}
+
 #[instrument(skip_all)]
 pub fn generate_all_browser_profiles(
     config: &Config,
     app_finder: &OSAppFinder,
-    force_reload: bool,
+    installed_browsers: &[InstalledBrowser],
 ) -> VisibleAndHiddenProfiles {
-    let installed_browsers = app_finder.get_installed_browsers_cached(force_reload);
     let hidden_apps = config.get_hidden_apps();
     let hidden_profiles = config.get_hidden_profiles();
 
@@ -666,26 +769,65 @@ pub fn unwrap_url(url_str: &str, behavioral_settings: &BehavioralConfig) -> Stri
     return transformed_url.unwrap_or(url_str.to_string());
 }
 
+// while running in the background, rescan the installed apps at most this often
+// (triggered by an incoming link, so the scan never runs while nobody is using the app)
+const RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+#[allow(clippy::too_many_arguments)]
 pub fn handle_messages_to_main(
     main_receiver: Receiver<MessageToMain>,
+    main_sender: Sender<MessageToMain>,
     ui_event_sink: UiHandle,
     opening_rules_and_default_profile: &mut OpeningRulesAndDefaultProfile,
     visible_and_hidden_profiles: &mut VisibleAndHiddenProfiles,
+    mut installed_browsers: Vec<InstalledBrowser>,
+    rescan_pending: bool,
     app_finder: &OSAppFinder,
 ) {
+    let mut rescan_in_flight = rescan_pending;
+    let mut last_scan = Instant::now();
+    if rescan_pending {
+        rescan_installed_browsers_in_background(main_sender.clone());
+    }
+
     for message in main_receiver.iter() {
         match message {
             MessageToMain::Refresh => {
                 info!("refresh called");
 
+                installed_browsers = app_finder.rescan_installed_browsers();
+                last_scan = Instant::now();
+
                 let config = app_finder.load_config();
+                *visible_and_hidden_profiles =
+                    generate_all_browser_profiles(&config, app_finder, &installed_browsers);
 
-                let visible_and_hidden_profiles =
-                    generate_all_browser_profiles(&config, &app_finder, true);
+                send_profiles(
+                    &ui_event_sink,
+                    visible_and_hidden_profiles,
+                    config.get_profile_order().clone(),
+                );
+            }
+            MessageToMain::InstalledBrowsersScanned(scanned_browsers) => {
+                rescan_in_flight = false;
+                last_scan = Instant::now();
 
-                let ui_browsers =
-                    real_to_ui_browsers(&visible_and_hidden_profiles.visible_browser_profiles);
-                ui_event_sink.new_browsers_received(ui_browsers);
+                if scanned_browsers == installed_browsers {
+                    debug!("Installed apps unchanged after rescan");
+                    continue;
+                }
+                info!("Installed apps changed, updating the list");
+                installed_browsers = scanned_browsers;
+
+                let config = app_finder.load_config();
+                *visible_and_hidden_profiles =
+                    generate_all_browser_profiles(&config, app_finder, &installed_browsers);
+
+                send_profiles(
+                    &ui_event_sink,
+                    visible_and_hidden_profiles,
+                    config.get_profile_order().clone(),
+                );
             }
             MessageToMain::OpenLink(profile_index, incognito_mode, url) => {
                 let option = &visible_and_hidden_profiles
@@ -703,7 +845,34 @@ pub fn handle_messages_to_main(
                 ui_event_sink.cleaned_url_opened(url_open_info);
             }
             MessageToMain::UrlPassedToMain(from_bundle_id, url, behavioral_config) => {
+                if !rescan_in_flight && last_scan.elapsed() >= RESCAN_INTERVAL {
+                    rescan_in_flight = true;
+                    rescan_installed_browsers_in_background(main_sender.clone());
+                }
+
+                if from_bundle_id == "com.apple.Safari" {
+                    // workaround for weird bug where Safari opens default browser on hard launch
+                    // see https://github.com/Browsers-software/browsers/issues/79
+                    info!("Ignoring a link from Safari, see issue #79");
+                    ui_event_sink.url_handled_without_popup();
+                    continue;
+                }
+
                 let new_modified_url = unwrap_url(url.as_str(), &behavioral_config);
+
+                // rules come first, so the popup never shows up for a link they handle
+                let url_open_context = UrlOpenContext {
+                    cleaned_url: new_modified_url.clone(),
+                    source_app_maybe: Some(from_bundle_id.clone()).filter(|id| !id.is_empty()),
+                };
+                if open_link_if_matching_rule(
+                    &url_open_context,
+                    opening_rules_and_default_profile,
+                    visible_and_hidden_profiles,
+                ) {
+                    ui_event_sink.url_handled_without_popup();
+                    continue;
+                }
 
                 let url_open_info = UrlOpenInfo {
                     url: new_modified_url,
@@ -764,7 +933,10 @@ pub fn handle_messages_to_main(
                     .map(|p| p.get_unique_id())
                     .collect();
 
+                // save the full order first, so the hidden profiles keep their place
                 let mut config = app_finder.load_config();
+                let profile_order =
+                    store_full_profile_order(&mut config, visible_and_hidden_profiles);
                 config.hide_all_profiles(&to_hide);
                 app_finder.save_config(&config);
 
@@ -780,18 +952,15 @@ pub fn handle_messages_to_main(
                         !delete
                     });
 
-                let ui_browsers =
-                    real_to_ui_browsers(&visible_and_hidden_profiles.visible_browser_profiles);
-                ui_event_sink.new_browsers_received(ui_browsers);
-
-                let ui_hidden_browsers =
-                    real_to_ui_browsers(&visible_and_hidden_profiles.hidden_browser_profiles);
-                ui_event_sink.new_hidden_browsers_received(ui_hidden_browsers);
+                send_profiles(&ui_event_sink, visible_and_hidden_profiles, profile_order);
             }
             MessageToMain::HideAppProfile(unique_id) => {
                 info!("Hiding profile {}", unique_id);
 
+                // save the full order first, so the hidden profile keeps its place
                 let mut config = app_finder.load_config();
+                let profile_order =
+                    store_full_profile_order(&mut config, visible_and_hidden_profiles);
                 config.hide_profile(unique_id.as_str());
                 app_finder.save_config(&config);
 
@@ -806,25 +975,18 @@ pub fn handle_messages_to_main(
                     visible_and_hidden_profiles
                         .hidden_browser_profiles
                         .push(visible_profile);
-
-                    let ui_browsers =
-                        real_to_ui_browsers(&visible_and_hidden_profiles.visible_browser_profiles);
-                    ui_event_sink.new_browsers_received(ui_browsers);
-
-                    let ui_hidden_browsers =
-                        real_to_ui_browsers(&visible_and_hidden_profiles.hidden_browser_profiles);
-                    ui_event_sink.new_hidden_browsers_received(ui_hidden_browsers);
                 }
+                send_profiles(&ui_event_sink, visible_and_hidden_profiles, profile_order);
             }
             MessageToMain::RestoreAppProfile(unique_id) => {
                 info!("Restoring profile {}", unique_id);
-                // will add to the end of visible profiles
+                // goes back to its place in the saved order (or to the end if it never had one)
 
                 let mut config = app_finder.load_config();
                 config.restore_profile(unique_id.as_str());
                 app_finder.save_config(&config);
 
-                let profile_order = config.get_profile_order();
+                let profile_order = config.get_profile_order().clone();
 
                 let hidden_profile_index_maybe = visible_and_hidden_profiles
                     .hidden_browser_profiles
@@ -840,25 +1002,36 @@ pub fn handle_messages_to_main(
 
                     sort_browser_profiles(
                         &mut visible_and_hidden_profiles.visible_browser_profiles,
-                        profile_order,
+                        &profile_order,
                     );
-
-                    let ui_browsers =
-                        real_to_ui_browsers(&visible_and_hidden_profiles.visible_browser_profiles);
-                    ui_event_sink.new_browsers_received(ui_browsers);
-
-                    let ui_hidden_browsers =
-                        real_to_ui_browsers(&visible_and_hidden_profiles.hidden_browser_profiles);
-                    ui_event_sink.new_hidden_browsers_received(ui_hidden_browsers);
+                }
+                send_profiles(&ui_event_sink, visible_and_hidden_profiles, profile_order);
+            }
+            MessageToMain::MoveAppProfile(unique_id, move_to) => {
+                let before = move_to_before_id(
+                    &visible_and_hidden_profiles.visible_browser_profiles,
+                    &unique_id,
+                    move_to,
+                );
+                if let Some(before) = before {
+                    move_app_profiles_before(
+                        &app_finder,
+                        visible_and_hidden_profiles,
+                        &[unique_id],
+                        before,
+                        &ui_event_sink,
+                    );
                 }
             }
-            MessageToMain::MoveAppProfile(unique_id, move_to) => move_app_profile(
-                &app_finder,
-                &mut visible_and_hidden_profiles.visible_browser_profiles,
-                unique_id,
-                move_to,
-                &ui_event_sink,
-            ),
+            MessageToMain::MoveAppProfilesBefore(unique_ids, before) => {
+                move_app_profiles_before(
+                    &app_finder,
+                    visible_and_hidden_profiles,
+                    &unique_ids,
+                    before,
+                    &ui_event_sink,
+                );
+            }
             MessageToMain::SaveConfigRules(ui_rules) => {
                 info!("Saving rules");
 
@@ -902,6 +1075,7 @@ pub fn handle_messages_to_main(
                     show_hotkeys: settings.show_hotkeys,
                     quit_on_lost_focus: settings.quit_on_lost_focus,
                     theme: settings.theme,
+                    non_browser_banner_dismissed: settings.non_browser_banner_dismissed,
                 };
 
                 let mut config = app_finder.load_config();
@@ -912,9 +1086,31 @@ pub fn handle_messages_to_main(
                 info!("Saving Behavioral settings");
                 let behavioral_config = BehavioralConfig {
                     unwrap_urls: settings.unwrap_urls,
+                    run_in_background: settings.run_in_background,
                 };
 
                 let mut config = app_finder.load_config();
+                config.set_behavior(behavioral_config);
+                app_finder.save_config(&config);
+            }
+            MessageToMain::AddRuleForDomain { domain, profile_id } => {
+                info!("Adding rule to open {} in {}", domain, profile_id);
+
+                let mut config = app_finder.load_config();
+                let new_rules = with_rule_for_domain(config.get_rules(), &domain, &profile_id);
+                config.set_rules(&new_rules);
+                app_finder.save_config(&config);
+
+                // same as SaveConfigRules - takes effect right away for this running instance
+                opening_rules_and_default_profile.opening_rules = to_opening_rules(&new_rules);
+            }
+            MessageToMain::SetRunInBackground(run_in_background) => {
+                info!("Saving run in background: {}", run_in_background);
+                let mut config = app_finder.load_config();
+                let behavioral_config = BehavioralConfig {
+                    run_in_background,
+                    ..config.get_behavior().clone()
+                };
                 config.set_behavior(behavioral_config);
                 app_finder.save_config(&config);
             }
@@ -1001,82 +1197,154 @@ fn map_as_profile_and_options(opener: &Option<UIProfileAndIncognito>) -> Option<
     });
 }
 
-fn move_app_profile(
-    app_finder: &OSAppFinder,
-    visible_browser_profiles: &mut Vec<CommonBrowserProfile>,
-    unique_id: String,
-    move_to: MoveTo,
+// rules with one that opens every link on `domain` in the given profile - replaces an existing
+// rule for exactly that domain (and no source app) instead of piling up duplicates
+fn with_rule_for_domain(rules: &[ConfigRule], domain: &str, profile_id: &str) -> Vec<ConfigRule> {
+    let opener = Some(ProfileAndOptions {
+        profile: profile_id.to_string(),
+        incognito: false,
+    });
+    let mut new_rules = rules.to_vec();
+    let existing = new_rules
+        .iter_mut()
+        .find(|r| r.get_source_app().is_none() && r.get_url_pattern().as_deref() == Some(domain));
+    match existing {
+        Some(rule) => rule.opener = opener,
+        None => new_rules.push(ConfigRule {
+            source_app: None,
+            url_pattern: Some(domain.to_string()),
+            opener,
+        }),
+    }
+    new_rules
+}
+
+fn profile_ids(profiles: &[CommonBrowserProfile]) -> Vec<String> {
+    profiles.iter().map(|p| p.get_unique_id()).collect()
+}
+
+fn priority_profile_ids(visible_and_hidden: &VisibleAndHiddenProfiles) -> Vec<String> {
+    visible_and_hidden
+        .visible_browser_profiles
+        .iter()
+        .chain(visible_and_hidden.hidden_browser_profiles.iter())
+        .filter(|p| p.has_priority_ordering())
+        .map(|p| p.get_unique_id())
+        .collect()
+}
+
+// every orderable profile id, visible and hidden, in their saved order.
+// Profiles with priority ordering are left out: they are always shown first anyway.
+fn orderable_profile_order(
+    visible_and_hidden: &VisibleAndHiddenProfiles,
+    saved_order: &[String],
+) -> Vec<String> {
+    let priority_ids = priority_profile_ids(visible_and_hidden);
+    profile_order::full_order(
+        &profile_ids(&visible_and_hidden.visible_browser_profiles),
+        &profile_ids(&visible_and_hidden.hidden_browser_profiles),
+        saved_order,
+    )
+    .into_iter()
+    .filter(|id| !priority_ids.contains(id))
+    .collect()
+}
+
+// writes the full order (hidden profiles included) into `config`, without saving it.
+// Hidden profiles then keep their place, so restoring one puts it back where it was.
+fn store_full_profile_order(
+    config: &mut Config,
+    visible_and_hidden: &VisibleAndHiddenProfiles,
+) -> Vec<String> {
+    let order = orderable_profile_order(visible_and_hidden, config.get_profile_order());
+    config.set_profile_order(&order);
+    order
+}
+
+fn send_profiles(
     ui_event_sink: &UiHandle,
+    visible_and_hidden: &VisibleAndHiddenProfiles,
+    profile_order: Vec<String>,
 ) {
-    let visible_profile_index_maybe = visible_browser_profiles
+    ui_event_sink.profiles_received(
+        real_to_ui_browsers(&visible_and_hidden.visible_browser_profiles),
+        real_to_ui_browsers(&visible_and_hidden.hidden_browser_profiles),
+        profile_order,
+    );
+}
+
+// translates a relative move of one visible profile into "move it right before this id" (inner
+// None = to the very end).
+// Returns None when the profile is unknown or already at the requested position.
+fn move_to_before_id(
+    visible_browser_profiles: &[CommonBrowserProfile],
+    unique_id: &str,
+    move_to: MoveTo,
+) -> Option<Option<String>> {
+    let orderable: Vec<String> = visible_browser_profiles
         .iter()
-        .position(|p| p.get_unique_id() == unique_id);
-
-    if visible_profile_index_maybe.is_none() {
-        warn!("Could not find visible profile for id {}", unique_id);
-        return;
-    }
-    let visible_profile_index = visible_profile_index_maybe.unwrap();
-
-    // TODO: this is a bit ugly; we keep profiles with has_priority_ordering() always on top
-    //       and everything else comes after; it might make sense to keep them in two separate
-    //       vectors (or slices)
-    let first_orderable_item_index_maybe = visible_browser_profiles
-        .iter()
-        .position(|b| !b.has_priority_ordering());
-
-    let first_orderable_item_index = match first_orderable_item_index_maybe {
-        Some(first_orderable_item_index) => first_orderable_item_index,
-        None => {
-            warn!("Could not find orderable profiles");
-            return;
-        }
-    };
-
-    // translate every direction (including a drag-and-drop's absolute target) into a single
-    // bounded index, clamped to the orderable range - so a multi-position drag becomes one
-    // rotation instead of N single-step moves, each round-tripping through the config file
-    let last_index = visible_browser_profiles.len() - 1;
-    let target_index = match move_to {
-        MoveTo::TOP => first_orderable_item_index,
-        MoveTo::UP => visible_profile_index
-            .saturating_sub(1)
-            .max(first_orderable_item_index),
-        MoveTo::DOWN => (visible_profile_index + 1).min(last_index),
-        MoveTo::BOTTOM => last_index,
-        MoveTo::ToIndex(index) => index.clamp(first_orderable_item_index, last_index),
-    };
-
-    if target_index == visible_profile_index {
-        info!(
-            "Not moving profile {} - already at the target position",
-            unique_id
-        );
-        return;
-    }
-    info!("Moving profile {} to index {}", unique_id, target_index);
-
-    // 1. update visible_browser_profiles
-    if target_index < visible_profile_index {
-        visible_browser_profiles[target_index..visible_profile_index + 1].rotate_right(1);
-    } else {
-        visible_browser_profiles[visible_profile_index..target_index + 1].rotate_left(1);
-    }
-
-    // 2. send visible_browser_profiles to gui
-    let ui_browsers = real_to_ui_browsers(&visible_browser_profiles);
-    ui_event_sink.new_browsers_received(ui_browsers);
-
-    // 3. update config file
-    let profile_ids_sorted: Vec<String> = visible_browser_profiles
-        .iter()
-        .filter(|b| !b.has_priority_ordering())
+        .filter(|p| !p.has_priority_ordering())
         .map(|p| p.get_unique_id())
         .collect();
+    let Some(position) = orderable.iter().position(|id| id == unique_id) else {
+        warn!("Could not find visible orderable profile for id {}", unique_id);
+        return None;
+    };
 
+    match move_to {
+        MoveTo::TOP if position == 0 => None,
+        MoveTo::TOP => Some(orderable.first().cloned()),
+        MoveTo::UP if position == 0 => None,
+        MoveTo::UP => Some(Some(orderable[position - 1].clone())),
+        MoveTo::DOWN if position + 1 >= orderable.len() => None,
+        MoveTo::DOWN => Some(orderable.get(position + 2).cloned()),
+        MoveTo::BOTTOM if position + 1 >= orderable.len() => None,
+        MoveTo::BOTTOM => Some(None),
+        MoveTo::ToIndex(index) => {
+            // index into the visible list as it would look without the moved profile
+            let rest: Vec<String> = visible_browser_profiles
+                .iter()
+                .map(|p| p.get_unique_id())
+                .filter(|id| id != unique_id)
+                .collect();
+            Some(rest.get(index).cloned())
+        }
+    }
+}
+
+// moves `unique_ids` (e.g. every profile of one app) right before `before`, or to the end.
+// Works on the full order including hidden profiles, so the result never depends on which rows
+// the window that started the move was showing.
+fn move_app_profiles_before(
+    app_finder: &OSAppFinder,
+    visible_and_hidden: &mut VisibleAndHiddenProfiles,
+    unique_ids: &[String],
+    before: Option<String>,
+    ui_event_sink: &UiHandle,
+) {
     let mut config = app_finder.load_config();
-    config.set_profile_order(&profile_ids_sorted);
+    let old_order = orderable_profile_order(visible_and_hidden, config.get_profile_order());
+
+    // profiles with priority ordering always stay on top, so "before one of them" means
+    // "before the first orderable profile"
+    let priority_ids = priority_profile_ids(visible_and_hidden);
+    let before = match before {
+        Some(id) if priority_ids.contains(&id) => old_order.first().cloned(),
+        other => other,
+    };
+
+    let new_order = profile_order::move_before(&old_order, unique_ids, before.as_deref());
+    if new_order == old_order {
+        info!("Not moving profiles {:?} - already in place", unique_ids);
+        return;
+    }
+    info!("Moving profiles {:?} before {:?}", unique_ids, before);
+
+    config.set_profile_order(&new_order);
     app_finder.save_config(&config);
+
+    sort_browser_profiles(&mut visible_and_hidden.visible_browser_profiles, &new_order);
+    send_profiles(ui_event_sink, visible_and_hidden, new_order);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1092,6 +1360,8 @@ pub enum MoveTo {
 #[derive(Debug)]
 pub enum MessageToMain {
     Refresh,
+    // result of rescan_installed_browsers_in_background
+    InstalledBrowsersScanned(Vec<InstalledBrowser>),
     OpenLink(usize, bool, String),
     // UrlOpenRequest is almost like LinkOpenedFromBundle, but triggers gui, not from gui
     UrlOpenRequest(String, String),
@@ -1102,8 +1372,144 @@ pub enum MessageToMain {
     HideAllProfiles(String),
     RestoreAppProfile(String),
     MoveAppProfile(String, MoveTo),
+    // moves the given profile ids right before another profile id (None = to the very end)
+    MoveAppProfilesBefore(Vec<String>, Option<String>),
     SaveConfigRules(Vec<UISettingsRule>),
     SaveConfigDefaultOpener(Option<UIProfileAndIncognito>),
     SaveConfigUISettings(UIVisualSettings),
     SaveConfigUIBehavioralSettings(UIBehavioralSettings),
+    // "Always open <domain> here" from the picker's row menu
+    AddRuleForDomain { domain: String, profile_id: String },
+    SetRunInBackground(bool),
+}
+
+#[cfg(test)]
+mod rule_for_domain_tests {
+    use super::*;
+
+    fn rule(source_app: Option<&str>, url_pattern: &str, profile: &str) -> ConfigRule {
+        ConfigRule {
+            source_app: source_app.map(str::to_string),
+            url_pattern: Some(url_pattern.to_string()),
+            opener: Some(ProfileAndOptions {
+                profile: profile.to_string(),
+                incognito: false,
+            }),
+        }
+    }
+
+    fn openers(rules: &[ConfigRule]) -> Vec<(Option<String>, Option<String>, String)> {
+        rules
+            .iter()
+            .map(|r| {
+                (
+                    r.get_source_app(),
+                    r.get_url_pattern(),
+                    r.get_opener().unwrap().profile,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn appends_new_domain_rule() {
+        let rules = vec![rule(None, "example.com", "a")];
+        let new_rules = with_rule_for_domain(&rules, "github.com", "b");
+        assert_eq!(
+            openers(&new_rules),
+            vec![
+                (None, Some("example.com".into()), "a".into()),
+                (None, Some("github.com".into()), "b".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn replaces_existing_domain_rule_but_not_source_app_rules() {
+        let rules = vec![
+            rule(Some("com.tinyspeck.slackmacgap"), "github.com", "a"),
+            rule(None, "github.com", "a"),
+        ];
+        let new_rules = with_rule_for_domain(&rules, "github.com", "b");
+        assert_eq!(
+            openers(&new_rules),
+            vec![
+                (
+                    Some("com.tinyspeck.slackmacgap".into()),
+                    Some("github.com".into()),
+                    "a".into()
+                ),
+                (None, Some("github.com".into()), "b".into()),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(source_app: &str, url_pattern: &str, target: Option<&str>) -> UISettingsRule {
+        UISettingsRule {
+            source_app: source_app.to_string(),
+            url_pattern: url_pattern.to_string(),
+            opener: target.map(|profile| UIProfileAndIncognito {
+                profile: profile.to_string(),
+                incognito: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_opening_rules_returns_first_matching_rule() {
+        let rules = vec![
+            rule("", "github.com/acme/**", Some("work")),
+            rule("", "github.com", Some("personal")),
+        ];
+        let outcome = test_opening_rules(&rules, false, "github.com/acme/api", None);
+        assert_eq!(outcome, RuleTestOutcome::MatchedRule(0));
+        let outcome = test_opening_rules(&rules, false, "https://github.com/other", None);
+        assert_eq!(outcome, RuleTestOutcome::MatchedRule(1));
+    }
+
+    #[test]
+    fn test_opening_rules_skips_rules_without_a_matcher_but_keeps_their_index() {
+        let rules = vec![
+            rule("", "", Some("nothing")),
+            rule("", "github.com/[", Some("broken")),
+            rule("", "github.com", Some("personal")),
+        ];
+        let outcome = test_opening_rules(&rules, false, "github.com", None);
+        assert_eq!(outcome, RuleTestOutcome::MatchedRule(2));
+    }
+
+    #[test]
+    fn test_opening_rules_matches_a_rule_that_shows_the_picker() {
+        let rules = vec![rule("", "github.com", None)];
+        let outcome = test_opening_rules(&rules, true, "github.com", None);
+        assert_eq!(outcome, RuleTestOutcome::MatchedRule(0));
+    }
+
+    #[test]
+    fn test_opening_rules_checks_source_app() {
+        let rules = vec![rule("com.tinyspeck.slackmacgap", "", Some("work"))];
+        let from_slack =
+            test_opening_rules(&rules, false, "x.com", Some("com.tinyspeck.slackmacgap"));
+        assert_eq!(from_slack, RuleTestOutcome::MatchedRule(0));
+        let from_anywhere = test_opening_rules(&rules, false, "x.com", None);
+        assert_eq!(from_anywhere, RuleTestOutcome::Picker);
+    }
+
+    #[test]
+    fn test_opening_rules_falls_back() {
+        let rules = vec![rule("", "notion.so", Some("work"))];
+        let outcome = test_opening_rules(&rules, true, "example.com", None);
+        assert_eq!(outcome, RuleTestOutcome::DefaultProfile);
+        let outcome = test_opening_rules(&rules, false, "example.com", None);
+        assert_eq!(outcome, RuleTestOutcome::Picker);
+        let outcome = test_opening_rules(&rules, false, "https://", None);
+        assert_eq!(outcome, RuleTestOutcome::InvalidUrl);
+        let outcome = test_opening_rules(&rules, false, "", None);
+        assert_eq!(outcome, RuleTestOutcome::InvalidUrl);
+    }
 }

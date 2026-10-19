@@ -3,17 +3,18 @@ use std::process::exit;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use copypasta::{ClipboardContext, ClipboardProvider};
-use slint::language::{DragAction, DropEvent};
-use slint::{ComponentHandle, DataTransfer, ModelRc, VecModel, Weak};
+use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
 
-use crate::MessageToMain;
-use crate::gui::app_state::{UIBrowser, UISettings, get_filtered_browsers};
+use crate::gui::app_state::{
+    UIBrowser, UIProfileAndIncognito, UISettings, UISettingsRule, get_filtered_browsers,
+};
 use crate::gui::generated::{AboutWindow, MainWindow, SettingsWindow};
 use crate::gui::icon_loader::IconLoader;
 use crate::gui::{about_window, main_window, screen, settings_window, theme};
-use crate::{MoveTo, UrlOpenInfo};
+use crate::{MessageToMain, UrlOpenInfo};
 
 pub type SharedState = Rc<RefCell<AppState>>;
 
@@ -30,12 +31,10 @@ pub struct AppState {
     pub restorable_app_profiles: Vec<UIBrowser>,
     pub show_set_as_default: bool,
     pub ui_settings: UISettings,
-}
 
-#[derive(Clone)]
-struct BrowserDragPayload {
-    unique_id: String,
-    source_index: usize,
+    // macOS launch without a URL on the command line - the popup waits for the GetURL event
+    // (see run), and this is cleared once a URL (or the timeout) shows it
+    pub awaiting_url: bool,
 }
 
 impl AppState {
@@ -46,6 +45,37 @@ impl AppState {
             && self.settings_window.is_none()
             && self.about_window.is_none()
     }
+
+    // macOS only: after use the popup is hidden and the app keeps running, so the next link
+    // shows it without a cold launch.
+    // Elsewhere the app always quits instead.
+    pub fn runs_in_background(&self) -> bool {
+        cfg!(target_os = "macos") && self.ui_settings.behavioral_settings.run_in_background
+    }
+
+    pub fn popup_visible(&self) -> bool {
+        self.main_window.window().is_visible()
+    }
+
+    // no window on screen at all - the popup's hidden (or not shown yet), and Settings/About are
+    // closed
+    fn nothing_visible(&self) -> bool {
+        !self.popup_visible() && self.settings_window.is_none() && self.about_window.is_none()
+    }
+}
+
+// how long a macOS launch without a URL waits for the GetURL event before showing the (URL-less)
+// popup anyway - it usually arrives within a few ms of the event loop starting
+const AWAIT_URL_TIMEOUT: Duration = Duration::from_millis(300);
+
+thread_local! {
+    // for logging how long the first appearance of the popup took, see record_launch_time
+    static LAUNCHED_AT: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+// call first thing in main, on the main thread
+pub fn record_launch_time() {
+    LAUNCHED_AT.with(|launched_at| launched_at.set(Some(Instant::now())));
 }
 
 pub fn new(
@@ -75,6 +105,7 @@ pub fn new(
         restorable_app_profiles,
         show_set_as_default,
         ui_settings,
+        awaiting_url: false,
     }));
 
     apply_theme(&state);
@@ -101,6 +132,7 @@ pub fn apply_theme(state: &SharedState) {
 pub fn refresh_main_window_model(state: &SharedState) {
     let mut st = state.borrow_mut();
     let show_hotkeys = st.ui_settings.visual_settings.show_hotkeys;
+    let filter_text = st.main_window.get_filter_text();
 
     // take the loader out so it can be borrowed mutably while iterating filtered_browsers by
     // reference, instead of cloning the whole browser list just to satisfy the borrow checker
@@ -108,7 +140,9 @@ pub fn refresh_main_window_model(state: &SharedState) {
     let items: Vec<_> = st
         .filtered_browsers
         .iter()
-        .map(|b| main_window::to_browser_item(b, &mut icons, show_hotkeys))
+        .filter(|b| main_window::matches_filter(b, &filter_text))
+        .enumerate()
+        .map(|(position, b)| main_window::to_browser_item(b, position, &mut icons, show_hotkeys))
         .collect();
     st.icons = icons;
     let restorable: Vec<_> = st
@@ -126,7 +160,9 @@ pub fn refresh_main_window_model(state: &SharedState) {
     crate::gui::ui_util::sync_vec_model(&win.get_browsers(), items);
     crate::gui::ui_util::sync_vec_model(&win.get_restorable_app_profiles(), restorable);
     win.set_show_set_as_default(show_set_as_default);
-    win.set_url_text(crate::gui::ui_util::ellipsize(&url, 28).into());
+    let (url_domain, url_path) = main_window::split_url_for_header(&url);
+    win.set_url_domain(url_domain.into());
+    win.set_url_path(url_path.into());
     win.set_icon_size(main_window::get_icon_size());
 
     // keep the focus index in range as the (filtered) list changes size - after a hide/restore/move,
@@ -183,22 +219,102 @@ pub fn clear_on_close<W: ComponentHandle + 'static>(
     let state = state.clone();
     win.window().on_close_requested(move || {
         clear(&mut state.borrow_mut());
+        if state.borrow().nothing_visible() {
+            on_last_window_closed(&state);
+        }
         slint::CloseRequestResponse::HideWindow
     });
 }
 
-// sets the window's pinned/actual size for the given browser count, returning that size so
-// callers that also need to reposition (see reposition_main_window) don't recompute it
-fn apply_main_window_size(win: &MainWindow, browser_count: usize) -> (f32, f32) {
+// the event loop keeps running without windows on macOS (see run), so it's decided here whether
+// closing Settings/About while the popup is hidden quits, like it did before
+fn on_last_window_closed(state: &SharedState) {
+    if !state.borrow().runs_in_background() {
+        exit(crate::QUIT_EXIT_CODE);
+    }
+    #[cfg(target_os = "macos")]
+    crate::macos::macos_native::hide_app();
+}
+
+// clears per-appearance state left over from the previous time the popup was shown (the
+// incognito modifier could still be held down when it was hidden, for one)
+fn reset_popup_state(win: &MainWindow) {
+    win.invoke_reset_state();
+}
+
+// shows the popup at the mouse cursor for the given URL, from a clean state
+pub fn show_popup_for_url(state: &SharedState, url: String) {
+    {
+        let mut st = state.borrow_mut();
+        st.awaiting_url = false;
+        st.url = url;
+        st.filtered_browsers = get_filtered_browsers(&st.url, &st.browsers);
+    }
+    refresh_main_window_model(state);
+    let win = state.borrow().main_window.clone_strong();
+    reset_popup_state(&win);
+    reposition_main_window(state);
+    win.window().show().ok();
+    #[cfg(target_os = "macos")]
+    crate::macos::macos_native::activate_app();
+    win.invoke_grab_focus();
+
+    match LAUNCHED_AT.with(|launched_at| launched_at.take()) {
+        Some(launched_at) => tracing::debug!(
+            "Popup shown, {} ms after launch",
+            launched_at.elapsed().as_millis()
+        ),
+        None => tracing::debug!("Popup shown"),
+    }
+}
+
+// the app was launched again while running - shows the popup like a launch without a URL would,
+// unless it's already showing a URL
+pub fn reopen(state: &SharedState) {
+    let win = state.borrow().main_window.clone_strong();
+    if win.window().is_visible() {
+        #[cfg(target_os = "macos")]
+        crate::macos::macos_native::activate_app();
+        win.invoke_grab_focus();
+        return;
+    }
+    win.set_source_app_name("".into());
+    show_popup_for_url(state, String::new());
+}
+
+// hides the popup without quitting (see AppState::runs_in_background), giving focus back to the
+// previous app unless Settings/About are still open
+pub fn hide_popup(state: &SharedState) {
+    let win = state.borrow().main_window.clone_strong();
+    win.window().hide().ok();
+    tracing::debug!("Popup hidden");
+    #[cfg(target_os = "macos")]
+    if state.borrow().nothing_visible() {
+        crate::macos::macos_native::hide_app();
+    }
+}
+
+// the popup was closed without opening a link (Escape, or focus lost with quit_on_lost_focus)
+pub fn dismiss_popup(state: &SharedState) {
+    if state.borrow().runs_in_background() {
+        hide_popup(state);
+    } else {
+        exit(crate::QUIT_EXIT_CODE);
+    }
+}
+
+// sets the window's pinned/actual size to fit the rows currently shown (after type-to-filter),
+// returning that size so callers that also need to reposition (see reposition_main_window) don't
+// recompute it
+fn apply_main_window_size(win: &MainWindow) -> (f32, f32) {
     let row_height = win
         .global::<crate::gui::generated::Layout>()
         .get_browser_row_height();
-    let dialog_size = main_window::recalculate_window_size(browser_count, row_height);
-    // the extra transparent part of the borderless window becomes a delete target while a
-    // browser row is being dragged
-    let size = (
-        dialog_size.0,
-        dialog_size.1 + win.get_delete_drop_area_height(),
+    let size = main_window::recalculate_window_size(
+        win.get_browsers().row_count(),
+        row_height,
+        win.get_chrome_height(),
+        win.get_popup_width(),
     );
 
     // keeps min-size == max-size in main_window.slint, so winit's own resizable-from-constraints
@@ -214,28 +330,25 @@ fn apply_main_window_size(win: &MainWindow, browser_count: usize) -> (f32, f32) 
 // launch, or a new URL opened while already running), not a same-URL refresh of an already-visible
 // window
 pub fn reposition_main_window(state: &SharedState) {
-    let st = state.borrow();
-    let browser_count = st.filtered_browsers.len();
-    let win = st.main_window.clone_strong();
-    drop(st);
+    let win = state.borrow().main_window.clone_strong();
 
     let (mouse, work_area) = screen::mouse_position_and_work_area();
-    let size = apply_main_window_size(&win, browser_count);
+    let size = apply_main_window_size(&win);
     let position = main_window::calculate_window_position(mouse, work_area, size);
 
-    win.window()
-        .set_position(slint::LogicalPosition::new(position.x, position.y));
+    // the mouse position is fractional, and a window at a fractional position got a backing
+    // surface one pixel wider than its size, which winit then kept correcting back and forth
+    win.window().set_position(slint::LogicalPosition::new(
+        position.x.round(),
+        position.y.round(),
+    ));
 }
 
 // resizes for the current browser count without moving it - for refreshing an already-visible
 // window's content (Refresh, restoring a hidden profile)
 pub fn resize_main_window(state: &SharedState) {
-    let st = state.borrow();
-    let browser_count = st.filtered_browsers.len();
-    let win = st.main_window.clone_strong();
-    drop(st);
-
-    apply_main_window_size(&win, browser_count);
+    let win = state.borrow().main_window.clone_strong();
+    apply_main_window_size(&win);
 }
 
 fn wire_main_window(state: &SharedState) {
@@ -243,8 +356,8 @@ fn wire_main_window(state: &SharedState) {
 
     {
         let state = state.clone();
-        win.on_open_browser(move |profile_index| {
-            open_browser(&state, profile_index as i64);
+        win.on_open_browser(move |profile_index, private| {
+            open_browser(&state, profile_index as i64, private);
         });
     }
     {
@@ -267,6 +380,23 @@ fn wire_main_window(state: &SharedState) {
             }
         });
     }
+    {
+        let state = state.clone();
+        win.on_filter_changed(move || {
+            refresh_main_window_model(&state);
+            let win = state.borrow().main_window.clone_strong();
+            // the best match is the first row, same as when the popup opens
+            win.set_focused_index(0);
+            resize_main_window(&state);
+        });
+    }
+    win.on_edit_filter(|current, key| main_window::edit_filter(&current, &key).into());
+    {
+        let state = state.clone();
+        win.on_always_open_here(move |profile_id, profile_index| {
+            always_open_here(&state, profile_id.to_string(), profile_index as i64);
+        });
+    }
     win.on_refresh(forward_handler(state, || MessageToMain::Refresh));
     win.on_set_browsers_default(forward_handler(state, || {
         MessageToMain::SetBrowsersAsDefaultBrowser
@@ -274,88 +404,6 @@ fn wire_main_window(state: &SharedState) {
     win.on_hide_profile(forward_id_handler(state, MessageToMain::HideAppProfile));
     win.on_hide_app(forward_id_handler(state, MessageToMain::HideAllProfiles));
     win.on_restore_profile(forward_id_handler(state, MessageToMain::RestoreAppProfile));
-    {
-        let state = state.clone();
-        win.on_move_profile(move |id, dir| {
-            let move_to = match dir.as_str() {
-                "top" => MoveTo::TOP,
-                "up" => MoveTo::UP,
-                "down" => MoveTo::DOWN,
-                _ => MoveTo::BOTTOM,
-            };
-            let _ = state
-                .borrow()
-                .main_sender
-                .send(MessageToMain::MoveAppProfile(id.to_string(), move_to));
-        });
-    }
-    win.on_make_browser_drag_data(|id, source_index| {
-        let mut transfer = DataTransfer::default();
-        transfer.set_user_data(Rc::new(BrowserDragPayload {
-            unique_id: id.to_string(),
-            source_index: source_index.max(0) as usize,
-        }));
-        transfer
-    });
-    win.on_can_drop_browser(|event: DropEvent, _target_index| {
-        if drag_payload(&event).is_some() {
-            event.proposed_action
-        } else {
-            DragAction::None
-        }
-    });
-    {
-        let state = state.clone();
-        win.on_browser_delete_dropped(move |event: DropEvent| {
-            let Some(payload) = move_payload(&event) else {
-                return;
-            };
-
-            let _ = state
-                .borrow()
-                .main_sender
-                .send(MessageToMain::HideAppProfile(payload.unique_id.clone()));
-        });
-    }
-    {
-        let state = state.clone();
-        win.on_browser_dropped(move |event: DropEvent, target_index| {
-            let Some(payload) = move_payload(&event) else {
-                return;
-            };
-
-            let (sender, browser_count, win) = {
-                let st = state.borrow();
-                (
-                    st.main_sender.clone(),
-                    st.filtered_browsers.len(),
-                    st.main_window.clone_strong(),
-                )
-            };
-            let source_index = payload.source_index;
-            if source_index >= browser_count {
-                return;
-            }
-
-            let target_index = (target_index.max(0) as usize).min(browser_count);
-            if target_index == source_index || target_index == source_index + 1 {
-                return;
-            }
-
-            let final_index = if target_index > source_index {
-                target_index - 1
-            } else {
-                target_index
-            };
-
-            let _ = sender.send(MessageToMain::MoveAppProfile(
-                payload.unique_id.clone(),
-                MoveTo::ToIndex(final_index),
-            ));
-
-            win.set_focused_index(final_index as i32);
-        });
-    }
     {
         let state = state.clone();
         win.on_show_settings(move || {
@@ -368,47 +416,84 @@ fn wire_main_window(state: &SharedState) {
             about_window::open(&state);
         });
     }
+    {
+        let state = state.clone();
+        win.on_dismiss(move || dismiss_popup(&state));
+    }
+    // the menu's Quit always quits, also while running in the background
     win.on_quit(move || {
         exit(crate::QUIT_EXIT_CODE);
     });
 }
 
-fn drag_payload(event: &DropEvent) -> Option<Rc<BrowserDragPayload>> {
-    event
-        .data
-        .user_data()
-        .and_then(|data| data.downcast::<BrowserDragPayload>().ok())
-}
-
-// the payload, but only for an actual move (not a copy/link) drop
-fn move_payload(event: &DropEvent) -> Option<Rc<BrowserDragPayload>> {
-    if event.proposed_action != DragAction::Move {
-        return None;
-    }
-    drag_payload(event)
-}
-
-// opens the browser at the given position in the (filtered) list shown in the window
+// opens the browser at the given position in the list as shown in the window (after the url and
+// type-to-filter narrowing)
 fn open_filtered(state: &SharedState, index: i32) {
-    let profile_index = usize::try_from(index).ok().and_then(|i| {
-        let st = state.borrow();
-        st.filtered_browsers.get(i).map(|b| b.browser_profile_index)
-    });
+    let win = state.borrow().main_window.clone_strong();
+    let profile_index = usize::try_from(index)
+        .ok()
+        .and_then(|i| win.get_browsers().row_data(i))
+        .map(|item| item.browser_profile_index);
     if let Some(profile_index) = profile_index {
-        open_browser(state, profile_index as i64);
+        open_browser(state, profile_index as i64, win.get_incognito_mode());
     }
 }
 
-fn open_browser(state: &SharedState, browser_profile_index: i64) {
-    if browser_profile_index < 0 {
+fn open_browser(state: &SharedState, browser_profile_index: i64, private: bool) {
+    let Ok(index) = usize::try_from(browser_profile_index) else {
+        return;
+    };
+    let st = state.borrow();
+    // rows without a private mode are faded out while ⇧ is held - opening one of those in a
+    // regular window instead would quietly break the "private" the user asked for
+    let supports_private = st.browsers.get(index).is_some_and(|b| b.supports_incognito);
+    if private && !supports_private {
         return;
     }
-    let st = state.borrow();
-    let _ = st.main_sender.send(MessageToMain::OpenLink(
-        browser_profile_index as usize,
-        st.main_window.get_incognito_mode(),
-        st.url.clone(),
-    ));
+    let _ = st
+        .main_sender
+        .send(MessageToMain::OpenLink(index, private, st.url.clone()));
+}
+
+// "Always open <domain> here": saves an opening rule for the link's domain pointing at this
+// profile, then opens the link in it
+fn always_open_here(state: &SharedState, profile_id: String, browser_profile_index: i64) {
+    let domain = {
+        let st = state.borrow();
+        main_window::split_url_for_header(&st.url).0
+    };
+    if domain.is_empty() {
+        return;
+    }
+
+    {
+        let mut st = state.borrow_mut();
+        // keep the in-memory copy Settings shows in sync with what gets saved
+        let rules = &mut st.ui_settings.rules;
+        let opener = Some(UIProfileAndIncognito {
+            profile: profile_id.clone(),
+            incognito: false,
+        });
+        match rules
+            .iter_mut()
+            .find(|r| r.source_app.is_empty() && r.url_pattern == domain)
+        {
+            Some(rule) => rule.opener = opener,
+            None => rules.push(UISettingsRule {
+                source_app: String::new(),
+                url_pattern: domain.clone(),
+                opener,
+            }),
+        }
+        let _ = st
+            .main_sender
+            .send(MessageToMain::AddRuleForDomain { domain, profile_id });
+    }
+    if state.borrow().settings_window.is_some() {
+        settings_window::refresh(state);
+    }
+
+    open_browser(state, browser_profile_index, false);
 }
 
 thread_local! {
@@ -441,51 +526,82 @@ impl UiHandle {
         });
     }
 
-    pub fn new_browsers_received(&self, browsers: Vec<UIBrowser>) {
+    // visible + hidden profiles and the saved order in one go, so the popup and Settings
+    // always update together after a hide/restore/move/rescan
+    pub fn profiles_received(
+        &self,
+        browsers: Vec<UIBrowser>,
+        hidden: Vec<UIBrowser>,
+        profile_order: Vec<String>,
+    ) {
         self.with_state(move |state| {
             {
                 let mut st = state.borrow_mut();
                 st.browsers = browsers;
                 st.filtered_browsers = get_filtered_browsers(&st.url, &st.browsers);
+                st.restorable_app_profiles = hidden;
+                st.ui_settings.profile_order = profile_order;
             }
             refresh_main_window_model(state);
             resize_main_window(state);
-        });
-    }
-
-    pub fn new_hidden_browsers_received(&self, hidden: Vec<UIBrowser>) {
-        self.with_state(move |state| {
-            state.borrow_mut().restorable_app_profiles = hidden;
-            refresh_main_window_model(state);
+            settings_window::refresh(state);
         });
     }
 
     pub fn cleaned_url_opened(&self, info: UrlOpenInfo) {
         self.with_state(move |state| {
             {
-                let mut st = state.borrow_mut();
-                st.url = info.url;
-                st.filtered_browsers = get_filtered_browsers(&st.url, &st.browsers);
+                let st = state.borrow();
+                let source_app_name = main_window::source_app_name(&info.source_bundle_id);
+                st.main_window.set_source_app_name(source_app_name.into());
             }
-            refresh_main_window_model(state);
-            reposition_main_window(state);
-            let win = state.borrow().main_window.clone_strong();
-            win.window().show().ok();
-            win.invoke_grab_focus();
+            show_popup_for_url(state, info.url);
+        });
+    }
+
+    // a URL was dealt with without the popup - opened by a matching rule, or ignored
+    pub fn url_handled_without_popup(&self) {
+        self.with_state(|state| {
+            state.borrow_mut().awaiting_url = false;
+            let (runs_in_background, nothing_visible) = {
+                let st = state.borrow();
+                (st.runs_in_background(), st.nothing_visible())
+            };
+            if !runs_in_background && nothing_visible {
+                exit(crate::QUIT_EXIT_CODE);
+            }
         });
     }
 
     pub fn open_link_completed(&self) {
-        self.with_state(|_state| {
-            exit(crate::QUIT_EXIT_CODE);
+        self.with_state(|state| {
+            if state.borrow().runs_in_background() {
+                hide_popup(state);
+            } else {
+                exit(crate::QUIT_EXIT_CODE);
+            }
         });
     }
 }
 
-pub fn run(state: &SharedState) {
+// with `await_url` the popup isn't shown until a URL arrives (see AWAIT_URL_TIMEOUT), so it
+// doesn't flash up empty first, and never shows at all when an opening rule handles the URL
+pub fn run(state: &SharedState, await_url: bool) {
     let win = state.borrow().main_window.clone_strong();
-    win.window().show().ok();
-    win.invoke_grab_focus();
+    if await_url {
+        state.borrow_mut().awaiting_url = true;
+        let state = state.clone();
+        slint::Timer::single_shot(AWAIT_URL_TIMEOUT, move || {
+            if state.borrow().awaiting_url {
+                tracing::debug!("No URL arrived, showing the popup without one");
+                let url = state.borrow().url.clone();
+                show_popup_for_url(&state, url);
+            }
+        });
+    } else {
+        let url = state.borrow().url.clone();
+        show_popup_for_url(state, url);
+    }
 
     {
         let state = state.clone();
@@ -512,6 +628,11 @@ pub fn run(state: &SharedState) {
     #[cfg(target_os = "windows")]
     hide_main_window_from_taskbar(&win);
 
+    // on macOS the app can keep running with all windows hidden (see
+    // AppState::runs_in_background), quitting is always an explicit exit() there
+    #[cfg(target_os = "macos")]
+    slint::run_event_loop_until_quit().ok();
+    #[cfg(not(target_os = "macos"))]
     slint::run_event_loop().ok();
 }
 
@@ -533,6 +654,14 @@ where
         };
         match win.window().winit_window().await {
             Ok(winit_window) => f(winit_window),
+            // expected with a non-winit backend, e.g. SLINT_BACKEND=headless for the MCP server
+            Err(err)
+                if err
+                    .to_string()
+                    .contains("not backed by a Winit window adapter") =>
+            {
+                tracing::debug!("{warn_msg}: {err}")
+            }
             Err(err) => tracing::warn!("{warn_msg}: {err}"),
         }
     });

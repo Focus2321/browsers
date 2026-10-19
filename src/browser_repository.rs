@@ -4,7 +4,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 use url::form_urlencoded::byte_serialize;
 
@@ -663,14 +663,33 @@ impl SupportedApp {
         return &self.restricted_url_matchers;
     }
 
+    // whether this app has real profiles we know how to find (Chromium/Firefox/Slack, ...)
+    pub fn has_profiles_parser(&self) -> bool {
+        self.find_profiles_fn.is_some()
+    }
+
     pub fn find_profiles(
         &self,
         binary_path: &Path,
         app_config_dir_abs: &Path,
     ) -> InstalledAppProfiles {
         return if let Some(find_profiles_fn) = self.find_profiles_fn {
-            let mut browser_profiles: Vec<InstalledBrowserProfile> =
-                find_profiles_fn(app_config_dir_abs, binary_path, self.get_app_id());
+            // profile files belong to other apps and can be in any state - a parser bug must
+            // not take down discovery of every other app (and the installed-apps cache write
+            // that follows it), so a panicking parser just means "no real profiles"
+            let found = std::panic::catch_unwind(|| {
+                find_profiles_fn(app_config_dir_abs, binary_path, self.get_app_id())
+            });
+            let mut browser_profiles: Vec<InstalledBrowserProfile> = match found {
+                Ok(browser_profiles) => browser_profiles,
+                Err(_) => {
+                    warn!(
+                        "Finding profiles of {} failed, using a placeholder profile",
+                        self.get_app_id()
+                    );
+                    Vec::new()
+                }
+            };
 
             browser_profiles.sort_by_key(|p| p.profile_name.clone());
             if browser_profiles.is_empty() {

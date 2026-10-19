@@ -10,7 +10,10 @@ pub fn ellipsize(text: &str, max_length: usize) -> String {
 // LineEdit's cursor position.
 //
 // model has to already be backed by a VecModel, and never replaced after that
-pub fn sync_vec_model<T: Clone + PartialEq + 'static>(model: &slint::ModelRc<T>, new_items: Vec<T>) {
+pub fn sync_vec_model<T: Clone + PartialEq + 'static>(
+    model: &slint::ModelRc<T>,
+    new_items: Vec<T>,
+) {
     use slint::Model;
 
     let vec_model = model

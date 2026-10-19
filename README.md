@@ -14,9 +14,56 @@ Browsers is an intuitive context menu that pops up when you press a link in an a
 **See our website for download links and instructions**<br>
 **https://browsers.software**
 
-![Text with web link is shown.
-User clicks on the web link.
-Popover menu with list of browsers and browser profiles is shown that user can choose from.](docs/browsers.gif "Animated recording of our tool")
+<p align="center">
+  <img src="docs/screenshots/popup-dark.png" width="300" alt="The link picker: the link's domain and path at the top, then browsers and profiles with the first one selected, and an action bar at the bottom" />
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/popup-private.png" width="300" alt="Holding Shift switches the picker to private mode and fades apps that can't open private windows" />
+</p>
+
+### The picker
+
+- **Shows up instantly.** Browsers keeps running quietly in the background, so the picker appears as soon as you click a link (you can turn this off in Settings).
+- **Shows where the link goes:** the domain, the path, and which app it came from.
+- **Profile-first rows:** each browser profile gets its own row, with a small badge showing its browser.
+- **Keyboard first:**
+  - <kbd>↑</kbd>/<kbd>↓</kbd> and <kbd>↵</kbd> to pick, <kbd>1</kbd>–<kbd>9</kbd> to jump.
+  - Type to filter, <kbd>⌘C</kbd> to copy the link.
+  - Hold <kbd>⇧</kbd> to open in a private window.
+- **Right-click a row** to open it privately, copy the link, **always open this site here** (creates a rule), hide the app, or manage browsers.
+
+<p align="center">
+  <img src="docs/screenshots/popup-filter.png" width="300" alt="Typing filters the list" />
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/popup-menu.png" width="300" alt="Right-click menu on a row" />
+</p>
+
+### Settings
+
+**Browsers:**
+- Drag to reorder, which is also the order in the picker.
+- Hide or show any app or profile with the eye button.
+- Profiles are grouped under their browser.
+- Browsers offers to hide the apps it found that aren't web browsers.
+
+![Settings, Browsers page](docs/screenshots/settings-browsers.png)
+
+**Rules:**
+- Send links to a specific browser or profile automatically, by site, by the app the link came from, or both.
+- Paste a link into **Test a link** to see which rule would catch it.
+- Rules run top to bottom, and you drag them to change the order.
+
+![Settings, Rules page](docs/screenshots/settings-rules.png)
+
+<details>
+<summary>More screenshots</summary>
+
+| | |
+|---|---|
+| ![Light popup](docs/screenshots/popup-light.png) | ![Dark settings](docs/screenshots/settings-browsers-dark.png) |
+| ![Reordering by drag](docs/screenshots/settings-drag.png) | ![A new rule is a draft until it has a pattern and a target](docs/screenshots/settings-rules-draft.png) |
+| ![General settings](docs/screenshots/settings-general.png) | |
+
+</details>
 
 ### Special Skills
 
@@ -29,8 +76,13 @@ Popover menu with list of browsers and browser profiles is shown that user can c
 
 ### Technical Special Skills
 
-- Does not run in the background. Opens and closes only when you use it.
+- Starts fast, and is instant when it's running in the background (macOS, on by default). Turn "Keep running in the background" off in Settings to have it quit after every link.
+- Remembers the apps it found, so it doesn't scan your disk every time you click a link.
 - Runs on Mac, Linux and Windows
+
+### Developing
+
+See [DEVELOPING.md](DEVELOPING.md) for running a dev build next to your installed copy.
 
 ### Download
 
