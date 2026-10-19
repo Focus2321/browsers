@@ -40,8 +40,16 @@ struct SettingsRulesPage: View {
             }
 
             Section {
-                ForEach(Array(rules.rules.enumerated()), id: \.offset) { index, rule in
-                    SettingsRuleRow(model: model, index: index, rule: rule)
+                if !rules.rules.isEmpty {
+                    SettingsReorderStack(
+                        contents: rules.rules.map { "\($0.pattern)|\($0.sourceId)|\($0.targetId)|\($0.isPrivate)" },
+                        levels: rules.rules.map { _ in .top },
+                        draggable: rules.rules.map { _ in true },
+                        onMove: { model.moveRule($0, to: $1) }
+                    ) { index, grip in
+                        SettingsRuleRow(model: model, index: index, rule: rules.rules[index], grip: grip)
+                    }
+                    .listRowInsets(EdgeInsets())
                 }
                 if let draft = rules.draft {
                     SettingsDraftRow(model: model, draft: draft)
@@ -198,25 +206,22 @@ private struct SettingsRuleRow: View {
     @ObservedObject var model: SettingsModel
     let index: Int
     let rule: SettingsRule
+    let grip: SettingsReorderGrip
 
     @State private var text = ""
     @FocusState private var focused: Bool
-    @State private var height: CGFloat = 60
 
     private var rules: SettingsRulesState { model.state.rules }
-
-    private var insertionEdge: SettingsInsertionLine.Edge? {
-        guard let drag = model.drag, drag.kind == .rule, let insertion = drag.insertion else { return nil }
-        if insertion == index { return .top }
-        if insertion == index + 1 && index == rules.rules.count - 1 { return .bottom }
-        return nil
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: RuleMetrics.spacing) {
-                SettingsDragHandle()
-                SettingsRuleNumber(number: index + 1, accent: rule.matched)
+                HStack(spacing: RuleMetrics.spacing) {
+                    SettingsDragHandle()
+                    SettingsRuleNumber(number: index + 1, accent: rule.matched)
+                }
+                .contentShape(Rectangle())
+                .modifier(grip)
                 SettingsPatternField(
                     text: Binding(get: { text }, set: { newText in
                         guard newText != text else { return }
@@ -270,16 +275,6 @@ private struct SettingsRuleRow: View {
         }
         .padding(.vertical, 2)
         .modifier(SettingsHighlight(active: rule.matched))
-        .contentShape(Rectangle())
-        .modifier(SettingsHeightReader(height: $height))
-        .overlay {
-            if let edge = insertionEdge { SettingsInsertionLine(edge: edge) }
-        }
-        .onDrop(of: [.plainText], delegate: SettingsRowDropDelegate(model: model, kind: .rule, index: index, height: height))
-        .onDrag {
-            model.beginDrag(.rule, from: index, id: "\(index)")
-            return NSItemProvider(object: "rule \(index)" as NSString)
-        }
         .onAppear { text = rule.displayedPattern }
         // Rust's answer never overwrites what's being typed, only a field that isn't focused
         .onChange(of: rule.displayedPattern) { pattern in

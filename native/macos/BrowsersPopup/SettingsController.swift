@@ -50,7 +50,6 @@ final class SettingsController {
         guard let window = settingsWindow, window.isVisible else { return }
         // ordered out first, so is_open is already false while Rust handles the event
         window.orderOut(nil)
-        model.endDrag()
         SettingsEvents.send("settings_closed")
     }
 
