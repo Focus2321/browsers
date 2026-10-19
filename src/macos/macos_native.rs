@@ -9,13 +9,15 @@ use std::path::PathBuf;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBitmapImageFileType, NSBitmapImageRep, NSEvent,
-    NSFloatingWindowLevel, NSScreen, NSView, NSWindowCollectionBehavior, NSWorkspace,
+    NSApplication, NSApplicationActivationPolicy, NSBitmapImageFileType, NSBitmapImageRep,
+    NSCompositingOperation, NSDeviceRGBColorSpace, NSEvent, NSFloatingWindowLevel,
+    NSGraphicsContext, NSImageInterpolation, NSScreen, NSView, NSWindowCollectionBehavior,
+    NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSBundle, NSDictionary, NSNotification, NSNotificationCenter,
-    NSObject, NSObjectProtocol, NSPoint, NSRect, NSSearchPathDirectory, NSSearchPathDomainMask,
-    NSSearchPathForDirectoriesInDomains, NSSize, NSString,
+    NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSearchPathDirectory,
+    NSSearchPathDomainMask, NSSearchPathForDirectoriesInDomains, NSSize, NSString, NSURL,
 };
 use tracing::{debug, warn};
 
@@ -242,37 +244,63 @@ pub fn register_event_bridge() -> Option<Retained<EventBridge>> {
     Some(bridge)
 }
 
-pub fn create_icon_for_app(full_path: &NSString, icon_path: &str) {
-    unsafe {
-        let shared_workspace = NSWorkspace::sharedWorkspace();
+// renders the app's Finder icon into a small PNG at icon_path.
+// Draws straight into a bitmap of the final pixel size, so NSImage only decodes the one
+// representation closest to that size - going through TIFFRepresentation instead encoded every
+// representation of the .icns (up to 1024x1024) and took ~190 ms per app.
+pub fn create_icon_for_app(full_path: &NSString, icon_path: &str) -> bool {
+    // the popup shows icons at 32pt, so this is enough for 2x (Retina) screens
+    const ICON_PIXELS: isize = 64;
 
-        let size = NSSize::new(64.0, 64.0);
+    let icon = NSWorkspace::sharedWorkspace().iconForFile(full_path);
 
-        // NSImage
-        let icon = shared_workspace.iconForFile(full_path);
-        // resize to smaller
-        icon.setSize(size);
+    let Some(bitmap) = (unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            ICON_PIXELS,
+            ICON_PIXELS,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            0,
+            0,
+        )
+    }) else {
+        warn!("Could not create a bitmap for the icon of {full_path}");
+        return false;
+    };
+    let size = NSSize::new(ICON_PIXELS as f64, ICON_PIXELS as f64);
+    bitmap.setSize(size);
 
-        icon.lockFocus();
+    let Some(context) = NSGraphicsContext::graphicsContextWithBitmapImageRep(&bitmap) else {
+        warn!("Could not create a graphics context for the icon of {full_path}");
+        return false;
+    };
 
-        let tiff = icon.TIFFRepresentation().unwrap();
+    // current context is per-thread, so this is safe off the main thread too
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&context));
+    context.setImageInterpolation(NSImageInterpolation::High);
+    icon.drawInRect_fromRect_operation_fraction(
+        NSRect::new(NSPoint::new(0.0, 0.0), size),
+        NSRect::ZERO,
+        NSCompositingOperation::Copy,
+        1.0,
+    );
+    context.flushGraphics();
+    NSGraphicsContext::restoreGraphicsState_class();
 
-        let rect = NSRect::new(NSPoint::new(0.0, 0.0), size);
-        let rep_from_tiff = NSBitmapImageRep::imageRepWithData(&tiff).unwrap();
+    let Some(icon_png) = (unsafe {
+        bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
+    }) else {
+        warn!("Could not encode the icon of {full_path} as PNG");
+        return false;
+    };
 
-        // draws icon into the rectangle
-        rep_from_tiff.drawInRect(rect);
-
-        let rect_as_image =
-            NSBitmapImageRep::initWithFocusedViewRect(NSBitmapImageRep::alloc(), rect).unwrap();
-        icon.unlockFocus();
-
-        let icon_png = rect_as_image
-            .representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
-            .unwrap();
-
-        icon_png.writeToFile_atomically(&NSString::from_str(icon_path), true);
-    }
+    icon_png.writeToFile_atomically(&NSString::from_str(icon_path), true)
 }
 
 pub fn get_bundle_url(bundle_id: &str) -> Option<Retained<NSString>> {
@@ -423,76 +451,87 @@ pub fn is_default_web_browser() -> bool {
     return https_bundle == bundle_id && http_bundle == bundle_id;
 }
 
-fn has_sandbox_entitlement2(bundle_url: &NSString) -> bool {
+// whether the app at bundle_path (e.g "/Applications/Slack.app") has the
+// com.apple.security.app-sandbox entitlement, i.e keeps its data under ~/Library/Containers.
+// Reads the code signature in-process via the Security framework, which takes about a
+// millisecond - spawning `codesign` for this took ~20 ms per app.
+pub fn is_app_sandboxed(bundle_path: &str) -> bool {
+    const ERR_SEC_SUCCESS: i32 = 0;
+    const K_SEC_CS_DEFAULT_FLAGS: u32 = 0;
+    // includes the entitlements dictionary in the returned signing information
+    const K_SEC_CS_REQUIREMENT_INFORMATION: u32 = 1 << 2;
+
+    let url = NSURL::fileURLWithPath(&NSString::from_str(bundle_path));
+
     unsafe {
-        let is_sandboxed = false;
-        //SecStaticCodeCreateWithPath(bundle_url, 0, nil)
-        //CFUrlRef *bundleURL = [[NSBundle mainBundle] bundleURL];
-
-        // Can use https://stackoverflow.com/a/42244464/752697
-        /*
-        BOOL isSandboxed = NO;
-
-        SecStaticCodeRef staticCode = NULL;
-        NSURL *bundleURL = [[NSBundle mainBundle] bundleURL];
-
-        if (SecStaticCodeCreateWithPath((__bridge CFURLRef)bundleURL, kSecCSDefaultFlags, &staticCode) == errSecSuccess) {
-            if (SecStaticCodeCheckValidityWithErrors(staticCode, kSecCSBasicValidateOnly, NULL, NULL) == errSecSuccess) {
-                SecRequirementRef sandboxRequirement;
-                if (SecRequirementCreateWithString(CFSTR("entitlement[\"com.apple.security.app-sandbox\"] exists"), kSecCSDefaultFlags,
-                                               &sandboxRequirement) == errSecSuccess)
-                {
-                    OSStatus codeCheckResult = SecStaticCodeCheckValidityWithErrors(staticCode, kSecCSBasicValidateOnly, sandboxRequirement, NULL);
-                    if (codeCheckResult == errSecSuccess) {
-                        isSandboxed = YES;
-                    }
-                }
-            }
-            CFRelease(staticCode);
+        let mut static_code: *const c_void = std::ptr::null();
+        let status = SecStaticCodeCreateWithPath(
+            Retained::as_ptr(&url) as *const c_void,
+            K_SEC_CS_DEFAULT_FLAGS,
+            &mut static_code,
+        );
+        if status != ERR_SEC_SUCCESS || static_code.is_null() {
+            debug!("Could not read code signature of {bundle_path} (status {status})");
+            return false;
         }
-        */
+
+        let mut information: *const c_void = std::ptr::null();
+        let status = SecCodeCopySigningInformation(
+            static_code,
+            K_SEC_CS_REQUIREMENT_INFORMATION,
+            &mut information,
+        );
+        CFRelease(static_code);
+        if status != ERR_SEC_SUCCESS || information.is_null() {
+            debug!("Could not read signing information of {bundle_path} (status {status})");
+            return false;
+        }
+
+        // CFDictionaryRef is toll-free bridged with NSDictionary, and we own this +1 reference
+        let information: Retained<NSDictionary<NSString, AnyObject>> =
+            Retained::from_raw(information as *mut NSDictionary<NSString, AnyObject>)
+                .expect("checked for null above");
+
+        let Some(entitlements) = information.objectForKey(kSecCodeInfoEntitlementsDict) else {
+            // unsigned or no entitlements at all
+            return false;
+        };
+        let Ok(entitlements) = entitlements.downcast::<NSDictionary>() else {
+            return false;
+        };
+        let Some(sandbox) =
+            entitlements.objectForKey(&NSString::from_str("com.apple.security.app-sandbox"))
+        else {
+            return false;
+        };
+        sandbox
+            .downcast::<NSNumber>()
+            .map(|sandbox| sandbox.boolValue())
+            .unwrap_or(false)
     }
+}
 
-    return false;
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    // SecStaticCodeRef/CFURLRef/CFDictionaryRef are all passed as opaque pointers
+    fn SecStaticCodeCreateWithPath(
+        path: *const c_void,
+        flags: u32,
+        static_code: *mut *const c_void,
+    ) -> i32;
 
-    // Or use codesign utility:
-    // codesign - d - -entitlements - --xml "/Applications/Slack.app"
+    fn SecCodeCopySigningInformation(
+        code: *const c_void,
+        flags: u32,
+        information: *mut *const c_void,
+    ) -> i32;
 
-    // TODO: check if "com.apple.security.app-sandbox" key exists and if it's value is true
-    /*
-    Executable=/Applications/Slack.app/Contents/MacOS/Slack
-    <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-        "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0">
-        <dict>
-            <key>com.apple.security.app-sandbox</key>
-            <true/>
-            <key>com.apple.security.application-groups</key>
-            <array>
-                <string>BQR82RBBHL.com.tinyspeck.slackmacgap</string>
-                <string>BQR82RBBHL.slack</string>
-            </array>
-            <key>com.apple.security.device.camera</key>
-            <true/>
-            <key>com.apple.security.device.microphone</key>
-            <true/>
-            <key>com.apple.security.device.usb</key>
-            <true/>
-            <key>com.apple.security.files.bookmarks.app-scope</key>
-            <true/>
-            <key>com.apple.security.files.downloads.read-write</key>
-            <true/>
-            <key>com.apple.security.files.user-selected.read-write</key>
-            <true/>
-            <key>com.apple.security.network.client</key>
-            <true/>
-            <key>com.apple.security.network.server</key>
-            <true/>
-            <key>com.apple.security.print</key>
-            <true/>
-        </dict>
-    </plist>
-     */
+    static kSecCodeInfoEntitlementsDict: &'static NSString;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRelease(cf: *const c_void);
 }
 
 #[link(name = "CoreServices", kind = "framework")]
@@ -508,4 +547,16 @@ unsafe extern "C" {
     pub fn LSCopyAllHandlersForURLScheme(
         in_url_scheme: &NSString,
     ) -> Option<Retained<NSArray<NSString>>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_app_sandboxed;
+
+    #[test]
+    fn detects_sandbox_entitlement() {
+        assert!(is_app_sandboxed("/System/Applications/Calculator.app"));
+        assert!(!is_app_sandboxed("/System/Applications/Utilities/Terminal.app"));
+        assert!(!is_app_sandboxed("/nonexistent/Nothing.app"));
+    }
 }

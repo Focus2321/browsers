@@ -663,6 +663,11 @@ impl SupportedApp {
         return &self.restricted_url_matchers;
     }
 
+    // whether this app has real profiles we know how to find (Chromium/Firefox/Slack, ...)
+    pub fn has_profiles_parser(&self) -> bool {
+        self.find_profiles_fn.is_some()
+    }
+
     pub fn find_profiles(
         &self,
         binary_path: &Path,
