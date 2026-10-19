@@ -15,7 +15,7 @@ use crate::gui::generated::{AboutWindow, MainWindow, SettingsWindow};
 use crate::gui::icon_loader::IconLoader;
 use crate::gui::{about_window, main_window, screen, settings_window, theme};
 #[cfg(target_os = "macos")]
-use crate::macos::native_popup;
+use crate::macos::{native_popup, native_settings};
 use crate::{MessageToMain, UrlOpenInfo};
 
 pub type SharedState = Rc<RefCell<AppState>>;
@@ -58,8 +58,25 @@ impl AppState {
     // out of sync with them
     pub fn quit_on_lost_focus_applies(&self) -> bool {
         self.ui_settings.visual_settings.quit_on_lost_focus
-            && self.settings_window.is_none()
-            && self.about_window.is_none()
+            && !self.settings_open()
+            && !self.about_open()
+    }
+
+    // the native window (see macos::native_settings) or the Slint one
+    pub fn settings_open(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if native_settings::settings_is_open() {
+            return true;
+        }
+        self.settings_window.is_some()
+    }
+
+    pub fn about_open(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if native_settings::about_is_open() {
+            return true;
+        }
+        self.about_window.is_some()
     }
 
     // macOS only: after use the popup is hidden and the app keeps running, so the next link
@@ -93,7 +110,7 @@ impl AppState {
     // no window on screen at all - the popup's hidden (or not shown yet), and Settings/About are
     // closed
     fn nothing_visible(&self) -> bool {
-        !self.popup_visible() && self.settings_window.is_none() && self.about_window.is_none()
+        !self.popup_visible() && !self.settings_open() && !self.about_open()
     }
 }
 
@@ -128,6 +145,9 @@ pub fn new(
 
     #[cfg(target_os = "macos")]
     native_popup::init(on_native_popup_event);
+    // decided once here like the popup, but independent of the "Native popup" setting
+    #[cfg(target_os = "macos")]
+    native_settings::init(on_native_settings_event);
 
     let state = Rc::new(RefCell::new(AppState {
         main_sender,
@@ -176,6 +196,11 @@ pub fn apply_theme(state: &SharedState) {
     #[cfg(target_os = "macos")]
     if state.borrow().native_popup_active() {
         update_native_popup(state);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        settings_window::refresh_native(state);
+        about_window::refresh_native(state);
     }
 }
 
@@ -279,15 +304,20 @@ pub fn clear_on_close<W: ComponentHandle + 'static>(
     let state = state.clone();
     win.window().on_close_requested(move || {
         clear(&mut state.borrow_mut());
-        if state.borrow().nothing_visible() {
-            on_last_window_closed(&state);
-        } else {
-            // once this window is gone (so it can't take the focus back)
-            let state = state.clone();
-            slint::Timer::single_shot(Duration::ZERO, move || refocus_popup(&state));
-        }
+        window_closed(&state);
         slint::CloseRequestResponse::HideWindow
     });
+}
+
+// after Settings or About (Slint or native) closed
+fn window_closed(state: &SharedState) {
+    if state.borrow().nothing_visible() {
+        on_last_window_closed(state);
+    } else {
+        // once this window is gone (so it can't take the focus back)
+        let state = state.clone();
+        slint::Timer::single_shot(Duration::ZERO, move || refocus_popup(&state));
+    }
 }
 
 // the event loop keeps running without windows on macOS (see run), so it's decided here whether
@@ -574,6 +604,23 @@ fn wire_main_window(state: &SharedState) {
     });
 }
 
+// the native Settings and About windows' events.
+// Closing runs what closing the Slint windows does (see clear_on_close), the rest goes to the
+// handlers the Slint Settings window's callbacks use.
+#[cfg(target_os = "macos")]
+fn on_native_settings_event(event: native_settings::SettingsEvent) {
+    use native_settings::SettingsEvent;
+
+    // cloned out, so APP_STATE itself isn't borrowed while the event is handled
+    let Some(state) = APP_STATE.with(|s| s.borrow().clone()) else {
+        return;
+    };
+    match event {
+        SettingsEvent::SettingsClosed | SettingsEvent::AboutClosed => window_closed(&state),
+        event => settings_window::handle_native_event(&state, event),
+    }
+}
+
 // the native popup's events, mapped to the same actions as the Slint popup's callbacks in
 // wire_main_window.
 // Swift calls this on the main thread, from inside the AppKit event loop winit runs.
@@ -684,7 +731,7 @@ fn always_open_here(state: &SharedState, profile_id: String, browser_profile_ind
             .main_sender
             .send(MessageToMain::AddRuleForDomain { domain, profile_id });
     }
-    if state.borrow().settings_window.is_some() {
+    if state.borrow().settings_open() {
         settings_window::refresh(state);
     }
 

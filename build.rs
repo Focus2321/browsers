@@ -58,6 +58,29 @@ fn command_output(program: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+// the native About window's "Made with Slint" badge shows the Slint version actually built
+// against, which only Cargo.lock knows
+#[cfg(target_os = "macos")]
+fn emit_slint_version() {
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    let Ok(lock) = fs::read_to_string("Cargo.lock") else {
+        return;
+    };
+    let mut lines = lock.lines();
+    while let Some(line) = lines.next() {
+        if line == "name = \"slint\"" {
+            let version = lines
+                .next()
+                .and_then(|l| l.strip_prefix("version = \""))
+                .and_then(|l| l.strip_suffix('"'));
+            if let Some(version) = version {
+                println!("cargo:rustc-env=BROWSERS_SLINT_VERSION={version}");
+            }
+            return;
+        }
+    }
+}
+
 // compiles the native (SwiftUI) popup in native/macos/BrowsersPopup/ into a static library and
 // links it, together with the Swift runtime.
 // Only needs swiftc from the Command Line Tools, no Xcode project.
@@ -145,6 +168,7 @@ fn main() {
     compile_slint_files();
     copy_resources();
     compile_swift_popup();
+    emit_slint_version();
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
     const ROOT_DIR: &str = env!("CARGO_MANIFEST_DIR");

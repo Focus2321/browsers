@@ -11,6 +11,7 @@ pub mod app_state;
 pub mod icon_loader;
 pub mod main_window;
 pub mod screen;
+pub mod settings_model;
 pub mod settings_window;
 pub mod theme;
 pub mod ui_util;
