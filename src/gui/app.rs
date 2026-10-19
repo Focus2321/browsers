@@ -221,6 +221,10 @@ pub fn clear_on_close<W: ComponentHandle + 'static>(
         clear(&mut state.borrow_mut());
         if state.borrow().nothing_visible() {
             on_last_window_closed(&state);
+        } else {
+            // once this window is gone (so it can't take the focus back)
+            let state = state.clone();
+            slint::Timer::single_shot(Duration::ZERO, move || refocus_popup(&state));
         }
         slint::CloseRequestResponse::HideWindow
     });
@@ -301,6 +305,44 @@ pub fn dismiss_popup(state: &SharedState) {
     } else {
         exit(crate::QUIT_EXIT_CODE);
     }
+}
+
+// another app took focus (a click elsewhere, Cmd+Tab, ...).
+// The popup floats above every window, so leaving it up would strand it on screen: while running
+// in the background it's always hidden (the next link shows it again instantly), also when
+// Settings is open. Otherwise closing means quitting, which "Close when clicking elsewhere" opts
+// into.
+pub fn on_app_lost_focus(state: &SharedState) {
+    let (popup_visible, runs_in_background, quit_applies) = {
+        let st = state.borrow();
+        (
+            st.popup_visible(),
+            st.runs_in_background(),
+            st.quit_on_lost_focus_applies(),
+        )
+    };
+    // hiding the app ourselves (see hide_popup) resigns active too, with the popup already gone
+    if !popup_visible {
+        return;
+    }
+    if runs_in_background {
+        hide_popup(state);
+    } else if quit_applies {
+        dismiss_popup(state);
+    }
+}
+
+// makes the popup the key window again, so Escape and the arrow keys reach it - closing
+// Settings/About doesn't hand the keyboard back to it on its own
+fn refocus_popup(state: &SharedState) {
+    let win = state.borrow().main_window.clone_strong();
+    if !win.window().is_visible() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    crate::macos::macos_native::activate_app();
+    win.window().show().ok();
+    win.invoke_grab_focus();
 }
 
 // sets the window's pinned/actual size to fit the rows currently shown (after type-to-filter),

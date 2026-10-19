@@ -17,6 +17,23 @@ pub fn full_order(visible: &[String], hidden: &[String], saved_order: &[String])
     all
 }
 
+// keeps each app's profiles together: every profile moves up to where its app's first profile
+// sits, keeping its order among them.
+// The popup and Settings both show an app's profiles as one group, wherever they were saved.
+pub fn group_by_app<T>(items: Vec<T>, app_id: impl Fn(&T) -> String) -> Vec<T> {
+    let apps: Vec<String> = items.iter().map(&app_id).collect();
+    let mut keyed: Vec<(usize, usize, T)> = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let first = apps.iter().position(|a| *a == apps[i]).unwrap_or(i);
+            (first, i, item)
+        })
+        .collect();
+    keyed.sort_by_key(|(first, i, _)| (*first, *i));
+    keyed.into_iter().map(|(_, _, item)| item).collect()
+}
+
 // moves every id in `moving` (keeping their relative order) so they sit right before `before`,
 // or at the very end when `before` is None.
 // Dropping onto one of the moved ids is a no-op.
@@ -70,6 +87,24 @@ mod tests {
             &ids(&["chrome"]),
         );
         assert_eq!(order, ids(&["chrome", "new1", "new2", "slack"]));
+    }
+
+    #[test]
+    fn group_by_app_pulls_profiles_up_to_their_first_one() {
+        // a Chrome profile saved above Brave keeps the whole Chrome group in that spot
+        let order = ids(&["chrome#work", "brave", "chrome#tf", "safari", "chrome#me"]);
+        let grouped = group_by_app(order, |id| id.split('#').next().unwrap().to_string());
+        assert_eq!(
+            grouped,
+            ids(&["chrome#work", "chrome#tf", "chrome#me", "brave", "safari"])
+        );
+    }
+
+    #[test]
+    fn group_by_app_keeps_an_already_grouped_order() {
+        let order = ids(&["safari", "chrome#1", "chrome#2", "brave"]);
+        let grouped = group_by_app(order.clone(), |id| id.split('#').next().unwrap().to_string());
+        assert_eq!(grouped, order);
     }
 
     #[test]

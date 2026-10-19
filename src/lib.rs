@@ -725,6 +725,10 @@ fn sort_browser_profiles(
         return order_maybe.unwrap_or(unordered_index);
     });
 
+    // an app's profiles always sit together, even if the saved order split them up
+    let sorted = std::mem::take(visible_browser_profiles);
+    *visible_browser_profiles = profile_order::group_by_app(sorted, |p| p.get_unique_app_id());
+
     // always show special apps first
     visible_browser_profiles.sort_by_key(|b| !b.has_priority_ordering());
 }
@@ -1240,11 +1244,20 @@ fn orderable_profile_order(
     saved_order: &[String],
 ) -> Vec<String> {
     let priority_ids = priority_profile_ids(visible_and_hidden);
-    profile_order::full_order(
+    let app_ids: std::collections::HashMap<String, String> = visible_and_hidden
+        .visible_browser_profiles
+        .iter()
+        .chain(visible_and_hidden.hidden_browser_profiles.iter())
+        .map(|p| (p.get_unique_id(), p.get_unique_app_id()))
+        .collect();
+    let order = profile_order::full_order(
         &profile_ids(&visible_and_hidden.visible_browser_profiles),
         &profile_ids(&visible_and_hidden.hidden_browser_profiles),
         saved_order,
-    )
+    );
+    profile_order::group_by_app(order, |id| {
+        app_ids.get(id).cloned().unwrap_or_else(|| id.clone())
+    })
     .into_iter()
     .filter(|id| !priority_ids.contains(id))
     .collect()

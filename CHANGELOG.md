@@ -21,6 +21,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Faster app discovery: smaller icons are only rendered when stale, without running `codesign` per app, and the app list is cached and refreshed in the background
 - Reordering apps put them in the wrong place when some apps were hidden
 - Refresh/Rescan didn't update the list
+- macOS: The picker could get stuck on screen after opening Settings or switching apps; it now hides whenever you click elsewhere while running in the background, and Escape works again after closing Settings
+- A browser's profiles always show as one group, also when a saved order had put another app between them
+- `make default-release` failed with "The file couldn't be opened" when the app was already the default browser
 
 ## [0.8.0] - 2026-10-09
 
