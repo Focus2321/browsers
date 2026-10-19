@@ -51,6 +51,12 @@ pub struct Palette {
     pub secondary_label_color_hover: Color,
     pub hotkey_background_color_hover: Color,
     pub hotkey_text_color_hover: Color,
+    pub selection_background_color: Color,
+    pub selection_label_color: Color,
+    pub selection_secondary_label_color: Color,
+    pub neutral_selection_background_color: Color,
+    pub separator_color: Color,
+    pub pill_background_color: Color,
 }
 
 fn argb(a: f32, r: f32, g: f32, b: f32) -> Color {
@@ -68,6 +74,9 @@ struct SharedPaletteFields {
     secondary_stroke_color: Color,
     highlight_background_color: Color,
     accent_color: Color,
+    selection_background_color: Color,
+    selection_label_color: Color,
+    selection_secondary_label_color: Color,
     browser_label_size: f32,
     profile_label_size: f32,
     url_label_size: f32,
@@ -79,7 +88,11 @@ fn shared_palette_fields() -> SharedPaletteFields {
         secondary_stroke_color: argb(0.9, 0.4, 0.4, 0.4),
         highlight_background_color: argb(0.25, 1.0, 1.0, 1.0),
         accent_color: Color::from_rgb_u8(25, 90, 194),
-        browser_label_size: 12.0,
+        // the picker's selected row - same accent in both themes, with white text on top
+        selection_background_color: Color::from_rgb_u8(0x24, 0x57, 0xd6),
+        selection_label_color: Color::from_rgb_u8(255, 255, 255),
+        selection_secondary_label_color: argb(0.75, 1.0, 1.0, 1.0),
+        browser_label_size: 13.0,
         profile_label_size: 11.0,
         url_label_size: 12.0,
     }
@@ -89,9 +102,9 @@ impl Palette {
     fn dark() -> Self {
         let shared = shared_palette_fields();
         Palette {
-            background_color: argb(0.9, 0.15, 0.15, 0.15),
+            background_color: argb(0.97, 0.12, 0.12, 0.125),
             label_color: Color::from_rgb_u8(255, 255, 255),
-            secondary_label_color: Color::from_rgb_u8(190, 190, 190),
+            secondary_label_color: Color::from_rgb_u8(165, 165, 170),
             muted_label_color: shared.muted_label_color,
             stroke_color: argb(0.1, 1.0, 1.0, 1.0),
             secondary_stroke_color: shared.secondary_stroke_color,
@@ -107,17 +120,23 @@ impl Palette {
             secondary_label_color_hover: Color::from_rgb_u8(255, 255, 255),
             hotkey_background_color_hover: Color::from_rgb_u8(38, 38, 38),
             hotkey_text_color_hover: Color::from_rgb_u8(255, 255, 255),
+            selection_background_color: shared.selection_background_color,
+            selection_label_color: shared.selection_label_color,
+            selection_secondary_label_color: shared.selection_secondary_label_color,
+            neutral_selection_background_color: argb(0.13, 1.0, 1.0, 1.0),
+            separator_color: argb(0.08, 1.0, 1.0, 1.0),
+            pill_background_color: argb(0.18, 1.0, 1.0, 1.0),
         }
     }
 
     fn light() -> Self {
         let shared = shared_palette_fields();
         Palette {
-            background_color: argb(0.9, 0.85, 0.85, 0.85),
-            label_color: Color::from_rgb_u8(0, 0, 0),
-            secondary_label_color: Color::from_rgb_u8(30, 30, 30),
+            background_color: argb(0.97, 0.965, 0.965, 0.97),
+            label_color: Color::from_rgb_u8(28, 28, 30),
+            secondary_label_color: Color::from_rgb_u8(100, 100, 106),
             muted_label_color: shared.muted_label_color,
-            stroke_color: argb(0.9, 0.7, 0.7, 0.7),
+            stroke_color: argb(0.16, 0.0, 0.0, 0.0),
             secondary_stroke_color: shared.secondary_stroke_color,
             highlight_background_color: shared.highlight_background_color,
             secondary_background_color: Color::from_rgb_u8(215, 215, 215),
@@ -131,6 +150,12 @@ impl Palette {
             secondary_label_color_hover: Color::from_rgb_u8(0, 0, 0),
             hotkey_background_color_hover: Color::from_rgb_u8(215, 215, 215),
             hotkey_text_color_hover: Color::from_rgb_u8(0, 0, 0),
+            selection_background_color: shared.selection_background_color,
+            selection_label_color: shared.selection_label_color,
+            selection_secondary_label_color: shared.selection_secondary_label_color,
+            neutral_selection_background_color: argb(0.09, 0.0, 0.0, 0.0),
+            separator_color: argb(0.08, 0.0, 0.0, 0.0),
+            pill_background_color: argb(0.1, 0.0, 0.0, 0.0),
         }
     }
 }
@@ -173,6 +198,12 @@ macro_rules! apply_palette {
         g.set_secondary_label_color_hover(p.secondary_label_color_hover);
         g.set_hotkey_background_color_hover(p.hotkey_background_color_hover);
         g.set_hotkey_text_color_hover(p.hotkey_text_color_hover);
+        g.set_selection_background_color(p.selection_background_color);
+        g.set_selection_label_color(p.selection_label_color);
+        g.set_selection_secondary_label_color(p.selection_secondary_label_color);
+        g.set_neutral_selection_background_color(p.neutral_selection_background_color);
+        g.set_separator_color(p.separator_color);
+        g.set_pill_background_color(p.pill_background_color);
     }};
 }
 
