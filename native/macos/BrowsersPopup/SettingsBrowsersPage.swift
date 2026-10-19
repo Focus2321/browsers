@@ -110,7 +110,8 @@ struct SettingsBrowsersPage: View {
     }
 }
 
-// the hidden count on "Show hidden", like a toolbar item badge
+// the hidden count on "Show hidden", like a toolbar item badge. Kept
+// inside the item bounds since toolbar items clip their overlays
 private struct SettingsToolbarBadge: View {
     let count: Int
 
@@ -121,7 +122,7 @@ private struct SettingsToolbarBadge: View {
             .padding(.horizontal, 4)
             .frame(minWidth: 14, minHeight: 14)
             .background(Capsule().fill(Color.red))
-            .offset(x: 6, y: -5)
+            .offset(x: 3, y: -1)
             .allowsHitTesting(false)
     }
 }
