@@ -526,22 +526,25 @@ impl UiHandle {
         });
     }
 
-    pub fn new_browsers_received(&self, browsers: Vec<UIBrowser>) {
+    // visible + hidden profiles and the saved order in one go, so the popup and Settings
+    // always update together after a hide/restore/move/rescan
+    pub fn profiles_received(
+        &self,
+        browsers: Vec<UIBrowser>,
+        hidden: Vec<UIBrowser>,
+        profile_order: Vec<String>,
+    ) {
         self.with_state(move |state| {
             {
                 let mut st = state.borrow_mut();
                 st.browsers = browsers;
                 st.filtered_browsers = get_filtered_browsers(&st.url, &st.browsers);
+                st.restorable_app_profiles = hidden;
+                st.ui_settings.profile_order = profile_order;
             }
             refresh_main_window_model(state);
             resize_main_window(state);
-        });
-    }
-
-    pub fn new_hidden_browsers_received(&self, hidden: Vec<UIBrowser>) {
-        self.with_state(move |state| {
-            state.borrow_mut().restorable_app_profiles = hidden;
-            refresh_main_window_model(state);
+            settings_window::refresh(state);
         });
     }
 

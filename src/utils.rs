@@ -88,6 +88,9 @@ pub struct UIConfig {
     pub quit_on_lost_focus: bool,
 
     pub theme: ConfiguredTheme,
+
+    // the "N of these aren't web browsers" banner in Settings was hidden for good
+    pub non_browser_banner_dismissed: bool,
 }
 
 impl Default for UIConfig {
@@ -96,6 +99,7 @@ impl Default for UIConfig {
             show_hotkeys: true,
             quit_on_lost_focus: false,
             theme: ConfiguredTheme::Auto,
+            non_browser_banner_dismissed: false,
         }
     }
 }

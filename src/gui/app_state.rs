@@ -25,6 +25,8 @@ pub struct UIBrowser {
     pub profile_icon_path: String,
     pub unique_id: String,
     pub unique_app_id: String,
+    // bundle id on macOS, what an opening rule's source app is compared against
+    pub bundle_id: String,
 
     // index among currently visible (filtered-by-url) browsers
     pub filtered_index: usize,
@@ -51,6 +53,8 @@ pub struct UISettings {
     pub rules: Vec<UISettingsRule>,
     pub visual_settings: UIVisualSettings,
     pub behavioral_settings: UIBehavioralSettings,
+    // saved order of orderable (non-priority) profile ids, see Config::get_profile_order
+    pub profile_order: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +62,7 @@ pub struct UIVisualSettings {
     pub show_hotkeys: bool,
     pub quit_on_lost_focus: bool,
     pub theme: ConfiguredTheme,
+    pub non_browser_banner_dismissed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +102,17 @@ impl UISettingsRule {
             Some(self.url_pattern.clone())
         }
     }
+
+    // whether the rule says what to match: a valid url pattern, or no pattern but a source app.
+    // A rule without an opener still counts, since matching it shows the picker.
+    pub fn has_valid_matcher(&self) -> bool {
+        let pattern = self.url_pattern.trim();
+        if pattern.is_empty() {
+            !self.source_app.is_empty()
+        } else {
+            crate::url_rule::is_valid_pattern(pattern)
+        }
+    }
 }
 
 fn map_as_ui_profile(
@@ -113,6 +129,7 @@ fn map_as_visual_settings(ui_config: &UIConfig) -> UIVisualSettings {
         show_hotkeys: ui_config.show_hotkeys,
         quit_on_lost_focus: ui_config.quit_on_lost_focus,
         theme: ui_config.theme,
+        non_browser_banner_dismissed: ui_config.non_browser_banner_dismissed,
     }
 }
 
@@ -139,6 +156,7 @@ pub fn config_to_ui_settings(config: &Config) -> UISettings {
         rules,
         visual_settings: map_as_visual_settings(config.get_ui_config()),
         behavioral_settings: map_as_ui_behavioural_settings(config.get_behavior()),
+        profile_order: config.get_profile_order().clone(),
     }
 }
 
@@ -175,6 +193,7 @@ pub fn real_to_ui_browsers(all_browser_profiles: &[CommonBrowserProfile]) -> Vec
                 .map_or("".to_string(), |a| a.to_string()),
             unique_id: p.get_unique_id(),
             unique_app_id: p.get_unique_app_id(),
+            bundle_id: p.get_browser_common().get_app_id().to_string(),
             filtered_index: i,
         })
         .collect()
@@ -211,4 +230,45 @@ pub fn get_filtered_browsers(url: &str, ui_browsers: &[UIBrowser]) -> Vec<UIBrow
     filtered.sort_by_key(|b| !b.has_priority_ordering());
 
     filtered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(source_app: &str, url_pattern: &str, target: Option<&str>) -> UISettingsRule {
+        UISettingsRule {
+            source_app: source_app.to_string(),
+            url_pattern: url_pattern.to_string(),
+            opener: target.map(|profile| UIProfileAndIncognito {
+                profile: profile.to_string(),
+                incognito: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn rule_with_valid_pattern_has_a_matcher() {
+        assert!(rule("", "github.com/acme/**", Some("chrome#work")).has_valid_matcher());
+        // no opener means "show the picker", which is still a rule
+        assert!(rule("", "github.com", None).has_valid_matcher());
+    }
+
+    #[test]
+    fn rule_with_only_source_app_has_a_matcher() {
+        assert!(rule("com.tinyspeck.slackmacgap", "", Some("chrome#work")).has_valid_matcher());
+    }
+
+    #[test]
+    fn rule_without_pattern_or_source_app_has_no_matcher() {
+        assert!(!rule("", "", Some("chrome#work")).has_valid_matcher());
+        assert!(!rule("", "   ", Some("chrome#work")).has_valid_matcher());
+    }
+
+    #[test]
+    fn rule_with_invalid_pattern_has_no_matcher() {
+        assert!(!rule("", "github.com/[", Some("chrome#work")).has_valid_matcher());
+        // a broken pattern isn't rescued by also having a source app
+        assert!(!rule("com.apple.mail", "github.com/[", Some("chrome#work")).has_valid_matcher());
+    }
 }
