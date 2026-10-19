@@ -5,15 +5,15 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use copypasta::{ClipboardContext, ClipboardProvider};
-use slint::language::{DragAction, DropEvent};
-use slint::{ComponentHandle, DataTransfer, ModelRc, VecModel, Weak};
+use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
 
-use crate::MessageToMain;
-use crate::gui::app_state::{UIBrowser, UISettings, get_filtered_browsers};
+use crate::gui::app_state::{
+    UIBrowser, UIProfileAndIncognito, UISettings, UISettingsRule, get_filtered_browsers,
+};
 use crate::gui::generated::{AboutWindow, MainWindow, SettingsWindow};
 use crate::gui::icon_loader::IconLoader;
 use crate::gui::{about_window, main_window, screen, settings_window, theme};
-use crate::{MoveTo, UrlOpenInfo};
+use crate::{MessageToMain, UrlOpenInfo};
 
 pub type SharedState = Rc<RefCell<AppState>>;
 
@@ -30,12 +30,6 @@ pub struct AppState {
     pub restorable_app_profiles: Vec<UIBrowser>,
     pub show_set_as_default: bool,
     pub ui_settings: UISettings,
-}
-
-#[derive(Clone)]
-struct BrowserDragPayload {
-    unique_id: String,
-    source_index: usize,
 }
 
 impl AppState {
@@ -101,6 +95,7 @@ pub fn apply_theme(state: &SharedState) {
 pub fn refresh_main_window_model(state: &SharedState) {
     let mut st = state.borrow_mut();
     let show_hotkeys = st.ui_settings.visual_settings.show_hotkeys;
+    let filter_text = st.main_window.get_filter_text();
 
     // take the loader out so it can be borrowed mutably while iterating filtered_browsers by
     // reference, instead of cloning the whole browser list just to satisfy the borrow checker
@@ -108,7 +103,9 @@ pub fn refresh_main_window_model(state: &SharedState) {
     let items: Vec<_> = st
         .filtered_browsers
         .iter()
-        .map(|b| main_window::to_browser_item(b, &mut icons, show_hotkeys))
+        .filter(|b| main_window::matches_filter(b, &filter_text))
+        .enumerate()
+        .map(|(position, b)| main_window::to_browser_item(b, position, &mut icons, show_hotkeys))
         .collect();
     st.icons = icons;
     let restorable: Vec<_> = st
@@ -126,7 +123,9 @@ pub fn refresh_main_window_model(state: &SharedState) {
     crate::gui::ui_util::sync_vec_model(&win.get_browsers(), items);
     crate::gui::ui_util::sync_vec_model(&win.get_restorable_app_profiles(), restorable);
     win.set_show_set_as_default(show_set_as_default);
-    win.set_url_text(crate::gui::ui_util::ellipsize(&url, 28).into());
+    let (url_domain, url_path) = main_window::split_url_for_header(&url);
+    win.set_url_domain(url_domain.into());
+    win.set_url_path(url_path.into());
     win.set_icon_size(main_window::get_icon_size());
 
     // keep the focus index in range as the (filtered) list changes size - after a hide/restore/move,
@@ -187,18 +186,18 @@ pub fn clear_on_close<W: ComponentHandle + 'static>(
     });
 }
 
-// sets the window's pinned/actual size for the given browser count, returning that size so
-// callers that also need to reposition (see reposition_main_window) don't recompute it
-fn apply_main_window_size(win: &MainWindow, browser_count: usize) -> (f32, f32) {
+// sets the window's pinned/actual size to fit the rows currently shown (after type-to-filter),
+// returning that size so callers that also need to reposition (see reposition_main_window) don't
+// recompute it
+fn apply_main_window_size(win: &MainWindow) -> (f32, f32) {
     let row_height = win
         .global::<crate::gui::generated::Layout>()
         .get_browser_row_height();
-    let dialog_size = main_window::recalculate_window_size(browser_count, row_height);
-    // the extra transparent part of the borderless window becomes a delete target while a
-    // browser row is being dragged
-    let size = (
-        dialog_size.0,
-        dialog_size.1 + win.get_delete_drop_area_height(),
+    let size = main_window::recalculate_window_size(
+        win.get_browsers().row_count(),
+        row_height,
+        win.get_chrome_height(),
+        win.get_popup_width(),
     );
 
     // keeps min-size == max-size in main_window.slint, so winit's own resizable-from-constraints
@@ -214,13 +213,10 @@ fn apply_main_window_size(win: &MainWindow, browser_count: usize) -> (f32, f32) 
 // launch, or a new URL opened while already running), not a same-URL refresh of an already-visible
 // window
 pub fn reposition_main_window(state: &SharedState) {
-    let st = state.borrow();
-    let browser_count = st.filtered_browsers.len();
-    let win = st.main_window.clone_strong();
-    drop(st);
+    let win = state.borrow().main_window.clone_strong();
 
     let (mouse, work_area) = screen::mouse_position_and_work_area();
-    let size = apply_main_window_size(&win, browser_count);
+    let size = apply_main_window_size(&win);
     let position = main_window::calculate_window_position(mouse, work_area, size);
 
     win.window()
@@ -230,12 +226,8 @@ pub fn reposition_main_window(state: &SharedState) {
 // resizes for the current browser count without moving it - for refreshing an already-visible
 // window's content (Refresh, restoring a hidden profile)
 pub fn resize_main_window(state: &SharedState) {
-    let st = state.borrow();
-    let browser_count = st.filtered_browsers.len();
-    let win = st.main_window.clone_strong();
-    drop(st);
-
-    apply_main_window_size(&win, browser_count);
+    let win = state.borrow().main_window.clone_strong();
+    apply_main_window_size(&win);
 }
 
 fn wire_main_window(state: &SharedState) {
@@ -243,8 +235,8 @@ fn wire_main_window(state: &SharedState) {
 
     {
         let state = state.clone();
-        win.on_open_browser(move |profile_index| {
-            open_browser(&state, profile_index as i64);
+        win.on_open_browser(move |profile_index, private| {
+            open_browser(&state, profile_index as i64, private);
         });
     }
     {
@@ -267,6 +259,23 @@ fn wire_main_window(state: &SharedState) {
             }
         });
     }
+    {
+        let state = state.clone();
+        win.on_filter_changed(move || {
+            refresh_main_window_model(&state);
+            let win = state.borrow().main_window.clone_strong();
+            // the best match is the first row, same as when the popup opens
+            win.set_focused_index(0);
+            resize_main_window(&state);
+        });
+    }
+    win.on_edit_filter(|current, key| main_window::edit_filter(&current, &key).into());
+    {
+        let state = state.clone();
+        win.on_always_open_here(move |profile_id, profile_index| {
+            always_open_here(&state, profile_id.to_string(), profile_index as i64);
+        });
+    }
     win.on_refresh(forward_handler(state, || MessageToMain::Refresh));
     win.on_set_browsers_default(forward_handler(state, || {
         MessageToMain::SetBrowsersAsDefaultBrowser
@@ -274,88 +283,6 @@ fn wire_main_window(state: &SharedState) {
     win.on_hide_profile(forward_id_handler(state, MessageToMain::HideAppProfile));
     win.on_hide_app(forward_id_handler(state, MessageToMain::HideAllProfiles));
     win.on_restore_profile(forward_id_handler(state, MessageToMain::RestoreAppProfile));
-    {
-        let state = state.clone();
-        win.on_move_profile(move |id, dir| {
-            let move_to = match dir.as_str() {
-                "top" => MoveTo::TOP,
-                "up" => MoveTo::UP,
-                "down" => MoveTo::DOWN,
-                _ => MoveTo::BOTTOM,
-            };
-            let _ = state
-                .borrow()
-                .main_sender
-                .send(MessageToMain::MoveAppProfile(id.to_string(), move_to));
-        });
-    }
-    win.on_make_browser_drag_data(|id, source_index| {
-        let mut transfer = DataTransfer::default();
-        transfer.set_user_data(Rc::new(BrowserDragPayload {
-            unique_id: id.to_string(),
-            source_index: source_index.max(0) as usize,
-        }));
-        transfer
-    });
-    win.on_can_drop_browser(|event: DropEvent, _target_index| {
-        if drag_payload(&event).is_some() {
-            event.proposed_action
-        } else {
-            DragAction::None
-        }
-    });
-    {
-        let state = state.clone();
-        win.on_browser_delete_dropped(move |event: DropEvent| {
-            let Some(payload) = move_payload(&event) else {
-                return;
-            };
-
-            let _ = state
-                .borrow()
-                .main_sender
-                .send(MessageToMain::HideAppProfile(payload.unique_id.clone()));
-        });
-    }
-    {
-        let state = state.clone();
-        win.on_browser_dropped(move |event: DropEvent, target_index| {
-            let Some(payload) = move_payload(&event) else {
-                return;
-            };
-
-            let (sender, browser_count, win) = {
-                let st = state.borrow();
-                (
-                    st.main_sender.clone(),
-                    st.filtered_browsers.len(),
-                    st.main_window.clone_strong(),
-                )
-            };
-            let source_index = payload.source_index;
-            if source_index >= browser_count {
-                return;
-            }
-
-            let target_index = (target_index.max(0) as usize).min(browser_count);
-            if target_index == source_index || target_index == source_index + 1 {
-                return;
-            }
-
-            let final_index = if target_index > source_index {
-                target_index - 1
-            } else {
-                target_index
-            };
-
-            let _ = sender.send(MessageToMain::MoveAppProfile(
-                payload.unique_id.clone(),
-                MoveTo::ToIndex(final_index),
-            ));
-
-            win.set_focused_index(final_index as i32);
-        });
-    }
     {
         let state = state.clone();
         win.on_show_settings(move || {
@@ -373,42 +300,74 @@ fn wire_main_window(state: &SharedState) {
     });
 }
 
-fn drag_payload(event: &DropEvent) -> Option<Rc<BrowserDragPayload>> {
-    event
-        .data
-        .user_data()
-        .and_then(|data| data.downcast::<BrowserDragPayload>().ok())
-}
-
-// the payload, but only for an actual move (not a copy/link) drop
-fn move_payload(event: &DropEvent) -> Option<Rc<BrowserDragPayload>> {
-    if event.proposed_action != DragAction::Move {
-        return None;
-    }
-    drag_payload(event)
-}
-
-// opens the browser at the given position in the (filtered) list shown in the window
+// opens the browser at the given position in the list as shown in the window (after the url and
+// type-to-filter narrowing)
 fn open_filtered(state: &SharedState, index: i32) {
-    let profile_index = usize::try_from(index).ok().and_then(|i| {
-        let st = state.borrow();
-        st.filtered_browsers.get(i).map(|b| b.browser_profile_index)
-    });
+    let win = state.borrow().main_window.clone_strong();
+    let profile_index = usize::try_from(index)
+        .ok()
+        .and_then(|i| win.get_browsers().row_data(i))
+        .map(|item| item.browser_profile_index);
     if let Some(profile_index) = profile_index {
-        open_browser(state, profile_index as i64);
+        open_browser(state, profile_index as i64, win.get_incognito_mode());
     }
 }
 
-fn open_browser(state: &SharedState, browser_profile_index: i64) {
-    if browser_profile_index < 0 {
+fn open_browser(state: &SharedState, browser_profile_index: i64, private: bool) {
+    let Ok(index) = usize::try_from(browser_profile_index) else {
+        return;
+    };
+    let st = state.borrow();
+    // rows without a private mode are faded out while ⇧ is held - opening one of those in a
+    // regular window instead would quietly break the "private" the user asked for
+    let supports_private = st.browsers.get(index).is_some_and(|b| b.supports_incognito);
+    if private && !supports_private {
         return;
     }
-    let st = state.borrow();
-    let _ = st.main_sender.send(MessageToMain::OpenLink(
-        browser_profile_index as usize,
-        st.main_window.get_incognito_mode(),
-        st.url.clone(),
-    ));
+    let _ = st
+        .main_sender
+        .send(MessageToMain::OpenLink(index, private, st.url.clone()));
+}
+
+// "Always open <domain> here": saves an opening rule for the link's domain pointing at this
+// profile, then opens the link in it
+fn always_open_here(state: &SharedState, profile_id: String, browser_profile_index: i64) {
+    let domain = {
+        let st = state.borrow();
+        main_window::split_url_for_header(&st.url).0
+    };
+    if domain.is_empty() {
+        return;
+    }
+
+    {
+        let mut st = state.borrow_mut();
+        // keep the in-memory copy Settings shows in sync with what gets saved
+        let rules = &mut st.ui_settings.rules;
+        let opener = Some(UIProfileAndIncognito {
+            profile: profile_id.clone(),
+            incognito: false,
+        });
+        match rules
+            .iter_mut()
+            .find(|r| r.source_app.is_empty() && r.url_pattern == domain)
+        {
+            Some(rule) => rule.opener = opener,
+            None => rules.push(UISettingsRule {
+                source_app: String::new(),
+                url_pattern: domain.clone(),
+                opener,
+            }),
+        }
+        let _ = st
+            .main_sender
+            .send(MessageToMain::AddRuleForDomain { domain, profile_id });
+    }
+    if state.borrow().settings_window.is_some() {
+        settings_window::refresh(state);
+    }
+
+    open_browser(state, browser_profile_index, false);
 }
 
 thread_local! {
@@ -466,6 +425,8 @@ impl UiHandle {
                 let mut st = state.borrow_mut();
                 st.url = info.url;
                 st.filtered_browsers = get_filtered_browsers(&st.url, &st.browsers);
+                let source_app_name = main_window::source_app_name(&info.source_bundle_id);
+                st.main_window.set_source_app_name(source_app_name.into());
             }
             refresh_main_window_model(state);
             reposition_main_window(state);
