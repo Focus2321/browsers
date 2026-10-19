@@ -27,9 +27,18 @@ struct SettingsBrowsersPage: View {
                 }
             } else {
                 Section {
-                    ForEach(Array(browsers.rows.enumerated()), id: \.element.id) { index, row in
-                        SettingsBrowserRow(model: model, list: .rows, index: index, row: row)
+                    let rows = browsers.rows
+                    SettingsReorderStack(
+                        keys: rows.map(\.id),
+                        levels: rows.map { $0.kind == .child ? .child : .top },
+                        draggable: rows.map(\.draggable),
+                        separatorInset: 10 + SettingsDragHandle.width + 10,
+                        wholeRowGrip: true,
+                        onMove: { model.moveBrowserRow($0, to: $1) }
+                    ) { index, _ in
+                        SettingsBrowserRow(model: model, list: .rows, index: index, row: rows[index])
                     }
+                    .listRowInsets(EdgeInsets())
                 } header: {
                     HStack(alignment: .firstTextBaseline) {
                         // a header that isn't a plain Text loses the header style, so it's restated
@@ -176,18 +185,7 @@ private struct SettingsBrowserRow: View {
     let index: Int
     let row: SettingsRow
 
-    @State private var height: CGFloat = 40
-
     private var draggable: Bool { list == .rows && row.draggable }
-
-    private var insertionEdge: SettingsInsertionLine.Edge? {
-        guard list == .rows, let drag = model.drag, drag.kind == .browserRow,
-              let insertion = drag.insertion
-        else { return nil }
-        if insertion == index { return .top }
-        if insertion == index + 1 && index == model.state.browsers.rows.count - 1 { return .bottom }
-        return nil
-    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -252,11 +250,6 @@ private struct SettingsBrowserRow: View {
         }
         .frame(minHeight: 30)
         .contentShape(Rectangle())
-        .modifier(SettingsHeightReader(height: $height))
-        .overlay {
-            if let edge = insertionEdge { SettingsInsertionLine(edge: edge) }
-        }
-        .modifier(BrowserRowDrag(model: model, list: list, index: index, row: row, draggable: draggable, height: height))
     }
 
     // the group's chevron; apps without profiles keep the space, so every icon lines up
@@ -277,34 +270,6 @@ private struct SettingsBrowserRow: View {
             .accessibilityLabel(row.collapsed ? "Expand \(row.name)" : "Collapse \(row.name)")
         } else {
             Color.clear.frame(width: 14, height: 1)
-        }
-    }
-}
-
-private struct BrowserRowDrag: ViewModifier {
-    let model: SettingsModel
-    let list: SettingsRowList
-    let index: Int
-    let row: SettingsRow
-    let draggable: Bool
-    let height: CGFloat
-
-    func body(content: Content) -> some View {
-        if list == .rows {
-            let dropTarget = content.onDrop(
-                of: [.plainText],
-                delegate: SettingsRowDropDelegate(model: model, kind: .browserRow, index: index, height: height)
-            )
-            if draggable {
-                dropTarget.onDrag {
-                    model.beginDrag(.browserRow, from: index, id: row.id)
-                    return NSItemProvider(object: row.id as NSString)
-                }
-            } else {
-                dropTarget
-            }
-        } else {
-            content
         }
     }
 }
