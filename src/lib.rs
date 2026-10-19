@@ -918,6 +918,17 @@ pub fn handle_messages_to_main(
                 config.set_behavior(behavioral_config);
                 app_finder.save_config(&config);
             }
+            MessageToMain::AddRuleForDomain { domain, profile_id } => {
+                info!("Adding rule to open {} in {}", domain, profile_id);
+
+                let mut config = app_finder.load_config();
+                let new_rules = with_rule_for_domain(config.get_rules(), &domain, &profile_id);
+                config.set_rules(&new_rules);
+                app_finder.save_config(&config);
+
+                // same as SaveConfigRules - takes effect right away for this running instance
+                opening_rules_and_default_profile.opening_rules = to_opening_rules(&new_rules);
+            }
         }
     }
 
@@ -999,6 +1010,28 @@ fn map_as_profile_and_options(opener: &Option<UIProfileAndIncognito>) -> Option<
         profile: p.profile.clone(),
         incognito: p.incognito,
     });
+}
+
+// rules with one that opens every link on `domain` in the given profile - replaces an existing
+// rule for exactly that domain (and no source app) instead of piling up duplicates
+fn with_rule_for_domain(rules: &[ConfigRule], domain: &str, profile_id: &str) -> Vec<ConfigRule> {
+    let opener = Some(ProfileAndOptions {
+        profile: profile_id.to_string(),
+        incognito: false,
+    });
+    let mut new_rules = rules.to_vec();
+    let existing = new_rules.iter_mut().find(|r| {
+        r.get_source_app().is_none() && r.get_url_pattern().as_deref() == Some(domain)
+    });
+    match existing {
+        Some(rule) => rule.opener = opener,
+        None => new_rules.push(ConfigRule {
+            source_app: None,
+            url_pattern: Some(domain.to_string()),
+            opener,
+        }),
+    }
+    new_rules
 }
 
 fn move_app_profile(
@@ -1106,4 +1139,68 @@ pub enum MessageToMain {
     SaveConfigDefaultOpener(Option<UIProfileAndIncognito>),
     SaveConfigUISettings(UIVisualSettings),
     SaveConfigUIBehavioralSettings(UIBehavioralSettings),
+    // "Always open <domain> here" from the picker's row menu
+    AddRuleForDomain { domain: String, profile_id: String },
+}
+
+#[cfg(test)]
+mod rule_for_domain_tests {
+    use super::*;
+
+    fn rule(source_app: Option<&str>, url_pattern: &str, profile: &str) -> ConfigRule {
+        ConfigRule {
+            source_app: source_app.map(str::to_string),
+            url_pattern: Some(url_pattern.to_string()),
+            opener: Some(ProfileAndOptions {
+                profile: profile.to_string(),
+                incognito: false,
+            }),
+        }
+    }
+
+    fn openers(rules: &[ConfigRule]) -> Vec<(Option<String>, Option<String>, String)> {
+        rules
+            .iter()
+            .map(|r| {
+                (
+                    r.get_source_app(),
+                    r.get_url_pattern(),
+                    r.get_opener().unwrap().profile,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn appends_new_domain_rule() {
+        let rules = vec![rule(None, "example.com", "a")];
+        let new_rules = with_rule_for_domain(&rules, "github.com", "b");
+        assert_eq!(
+            openers(&new_rules),
+            vec![
+                (None, Some("example.com".into()), "a".into()),
+                (None, Some("github.com".into()), "b".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn replaces_existing_domain_rule_but_not_source_app_rules() {
+        let rules = vec![
+            rule(Some("com.tinyspeck.slackmacgap"), "github.com", "a"),
+            rule(None, "github.com", "a"),
+        ];
+        let new_rules = with_rule_for_domain(&rules, "github.com", "b");
+        assert_eq!(
+            openers(&new_rules),
+            vec![
+                (
+                    Some("com.tinyspeck.slackmacgap".into()),
+                    Some("github.com".into()),
+                    "a".into()
+                ),
+                (None, Some("github.com".into()), "b".into()),
+            ]
+        );
+    }
 }
