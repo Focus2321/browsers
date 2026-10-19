@@ -161,6 +161,12 @@ fn compile_swift_popup() {
     println!("cargo:rustc-link-arg=-Wl,-weak_framework,SwiftUI");
     println!("cargo:rustc-link-arg=-Wl,-weak-lswiftCore");
     println!("cargo:rustc-link-lib=framework=AppKit");
+
+    // `#available` checks call __isPlatformVersionAtLeast from clang's runtime, which rustc's
+    // -nodefaultlibs leaves out
+    let clang_resource_dir = command_output("xcrun", &["clang", "-print-resource-dir"]);
+    println!("cargo:rustc-link-search=native={clang_resource_dir}/lib/darwin");
+    println!("cargo:rustc-link-lib=static=clang_rt.osx");
 }
 
 #[cfg(target_os = "macos")]
