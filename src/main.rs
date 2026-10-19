@@ -21,6 +21,8 @@ use browsers::{
 use browsers::{handle_messages_to_main, paths};
 
 fn main() {
+    app::record_launch_time();
+
     // prefer Skia over Slint's default femtovg on macOS - femtovg's lack of font hinting causes
     // small-text artifacts, Skia delegates to CoreText instead (see Cargo.toml for why it's
     // macOS-only).
@@ -154,9 +156,13 @@ fn main() {
     if let Some(bridge) = &bridge {
         let resign_active_state = state.clone();
         bridge.set_resign_active_handler(move || {
-            let quits = resign_active_state.borrow().quit_on_lost_focus_applies();
-            if quits {
-                std::process::exit(browsers::QUIT_EXIT_CODE);
+            let (applies, popup_visible) = {
+                let st = resign_active_state.borrow();
+                (st.quit_on_lost_focus_applies(), st.popup_visible())
+            };
+            // hiding the app ourselves (see app::hide_popup) resigns active too
+            if applies && popup_visible {
+                app::dismiss_popup(&resign_active_state);
             }
         });
 
@@ -172,6 +178,7 @@ fn main() {
                 unwrap_urls: behavioral_settings.unwrap_urls,
                 run_in_background: behavioral_settings.run_in_background,
             };
+            tracing::debug!("GetURL event received");
             let _ = open_urls_sender.send(MessageToMain::UrlPassedToMain(
                 sender_bundle_id.unwrap_or_default(),
                 url,
@@ -202,5 +209,20 @@ fn main() {
         browsers::gui::about_window::open(&state);
     }
 
-    app::run(&state);
+    // when macOS launches the app for a link, the URL arrives as an apple event once the event
+    // loop runs, rather than on the command line.
+    // Waiting for it lets opening rules handle it before any popup shows up.
+    let await_url = cfg!(target_os = "macos") && cleaned_url.is_empty();
+
+    #[cfg(target_os = "macos")]
+    if let Some(bridge) = bridge {
+        let reopen_state = state.clone();
+        slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+            bridge.set_reopen_handler(move || app::reopen(&reopen_state));
+            // the handler (and the GetURL one) live in the bridge, which has to outlive the app
+            std::mem::forget(bridge);
+        });
+    }
+
+    app::run(&state, await_url);
 }

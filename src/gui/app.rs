@@ -3,6 +3,7 @@ use std::process::exit;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use copypasta::{ClipboardContext, ClipboardProvider};
 use slint::language::{DragAction, DropEvent};
@@ -30,6 +31,10 @@ pub struct AppState {
     pub restorable_app_profiles: Vec<UIBrowser>,
     pub show_set_as_default: bool,
     pub ui_settings: UISettings,
+
+    // macOS launch without a URL on the command line - the popup waits for the GetURL event
+    // (see run), and this is cleared once a URL (or the timeout) shows it
+    pub awaiting_url: bool,
 }
 
 #[derive(Clone)]
@@ -46,6 +51,37 @@ impl AppState {
             && self.settings_window.is_none()
             && self.about_window.is_none()
     }
+
+    // macOS only: after use the popup is hidden and the app keeps running, so the next link
+    // shows it without a cold launch.
+    // Elsewhere the app always quits instead.
+    pub fn runs_in_background(&self) -> bool {
+        cfg!(target_os = "macos") && self.ui_settings.behavioral_settings.run_in_background
+    }
+
+    pub fn popup_visible(&self) -> bool {
+        self.main_window.window().is_visible()
+    }
+
+    // no window on screen at all - the popup's hidden (or not shown yet), and Settings/About are
+    // closed
+    fn nothing_visible(&self) -> bool {
+        !self.popup_visible() && self.settings_window.is_none() && self.about_window.is_none()
+    }
+}
+
+// how long a macOS launch without a URL waits for the GetURL event before showing the (URL-less)
+// popup anyway - it usually arrives within a few ms of the event loop starting
+const AWAIT_URL_TIMEOUT: Duration = Duration::from_millis(300);
+
+thread_local! {
+    // for logging how long the first appearance of the popup took, see record_launch_time
+    static LAUNCHED_AT: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+// call first thing in main, on the main thread
+pub fn record_launch_time() {
+    LAUNCHED_AT.with(|launched_at| launched_at.set(Some(Instant::now())));
 }
 
 pub fn new(
@@ -75,6 +111,7 @@ pub fn new(
         restorable_app_profiles,
         show_set_as_default,
         ui_settings,
+        awaiting_url: false,
     }));
 
     apply_theme(&state);
@@ -183,8 +220,88 @@ pub fn clear_on_close<W: ComponentHandle + 'static>(
     let state = state.clone();
     win.window().on_close_requested(move || {
         clear(&mut state.borrow_mut());
+        if state.borrow().nothing_visible() {
+            on_last_window_closed(&state);
+        }
         slint::CloseRequestResponse::HideWindow
     });
+}
+
+// the event loop keeps running without windows on macOS (see run), so it's decided here whether
+// closing Settings/About while the popup is hidden quits, like it did before
+fn on_last_window_closed(state: &SharedState) {
+    if !state.borrow().runs_in_background() {
+        exit(crate::QUIT_EXIT_CODE);
+    }
+    #[cfg(target_os = "macos")]
+    crate::macos::macos_native::hide_app();
+}
+
+// clears per-appearance state left over from the previous time the popup was shown (the
+// incognito modifier could still be held down when it was hidden, for one)
+fn reset_popup_state(win: &MainWindow) {
+    win.set_focused_index(0);
+    win.set_incognito_mode(false);
+}
+
+// shows the popup at the mouse cursor for the given URL, from a clean state
+pub fn show_popup_for_url(state: &SharedState, url: String) {
+    {
+        let mut st = state.borrow_mut();
+        st.awaiting_url = false;
+        st.url = url;
+        st.filtered_browsers = get_filtered_browsers(&st.url, &st.browsers);
+    }
+    refresh_main_window_model(state);
+    let win = state.borrow().main_window.clone_strong();
+    reset_popup_state(&win);
+    reposition_main_window(state);
+    win.window().show().ok();
+    #[cfg(target_os = "macos")]
+    crate::macos::macos_native::activate_app();
+    win.invoke_grab_focus();
+
+    match LAUNCHED_AT.with(|launched_at| launched_at.take()) {
+        Some(launched_at) => tracing::debug!(
+            "Popup shown, {} ms after launch",
+            launched_at.elapsed().as_millis()
+        ),
+        None => tracing::debug!("Popup shown"),
+    }
+}
+
+// the app was launched again while running - shows the popup like a launch without a URL would,
+// unless it's already showing a URL
+pub fn reopen(state: &SharedState) {
+    let win = state.borrow().main_window.clone_strong();
+    if win.window().is_visible() {
+        #[cfg(target_os = "macos")]
+        crate::macos::macos_native::activate_app();
+        win.invoke_grab_focus();
+        return;
+    }
+    show_popup_for_url(state, String::new());
+}
+
+// hides the popup without quitting (see AppState::runs_in_background), giving focus back to the
+// previous app unless Settings/About are still open
+pub fn hide_popup(state: &SharedState) {
+    let win = state.borrow().main_window.clone_strong();
+    win.window().hide().ok();
+    tracing::debug!("Popup hidden");
+    #[cfg(target_os = "macos")]
+    if state.borrow().nothing_visible() {
+        crate::macos::macos_native::hide_app();
+    }
+}
+
+// the popup was closed without opening a link (Escape, or focus lost with quit_on_lost_focus)
+pub fn dismiss_popup(state: &SharedState) {
+    if state.borrow().runs_in_background() {
+        hide_popup(state);
+    } else {
+        exit(crate::QUIT_EXIT_CODE);
+    }
 }
 
 // sets the window's pinned/actual size for the given browser count, returning that size so
@@ -368,6 +485,11 @@ fn wire_main_window(state: &SharedState) {
             about_window::open(&state);
         });
     }
+    {
+        let state = state.clone();
+        win.on_dismiss(move || dismiss_popup(&state));
+    }
+    // the menu's Quit always quits, also while running in the background
     win.on_quit(move || {
         exit(crate::QUIT_EXIT_CODE);
     });
@@ -462,30 +584,53 @@ impl UiHandle {
 
     pub fn cleaned_url_opened(&self, info: UrlOpenInfo) {
         self.with_state(move |state| {
-            {
-                let mut st = state.borrow_mut();
-                st.url = info.url;
-                st.filtered_browsers = get_filtered_browsers(&st.url, &st.browsers);
+            show_popup_for_url(state, info.url);
+        });
+    }
+
+    // a URL was dealt with without the popup - opened by a matching rule, or ignored
+    pub fn url_handled_without_popup(&self) {
+        self.with_state(|state| {
+            state.borrow_mut().awaiting_url = false;
+            let (runs_in_background, nothing_visible) = {
+                let st = state.borrow();
+                (st.runs_in_background(), st.nothing_visible())
+            };
+            if !runs_in_background && nothing_visible {
+                exit(crate::QUIT_EXIT_CODE);
             }
-            refresh_main_window_model(state);
-            reposition_main_window(state);
-            let win = state.borrow().main_window.clone_strong();
-            win.window().show().ok();
-            win.invoke_grab_focus();
         });
     }
 
     pub fn open_link_completed(&self) {
-        self.with_state(|_state| {
-            exit(crate::QUIT_EXIT_CODE);
+        self.with_state(|state| {
+            if state.borrow().runs_in_background() {
+                hide_popup(state);
+            } else {
+                exit(crate::QUIT_EXIT_CODE);
+            }
         });
     }
 }
 
-pub fn run(state: &SharedState) {
+// with `await_url` the popup isn't shown until a URL arrives (see AWAIT_URL_TIMEOUT), so it
+// doesn't flash up empty first, and never shows at all when an opening rule handles the URL
+pub fn run(state: &SharedState, await_url: bool) {
     let win = state.borrow().main_window.clone_strong();
-    win.window().show().ok();
-    win.invoke_grab_focus();
+    if await_url {
+        state.borrow_mut().awaiting_url = true;
+        let state = state.clone();
+        slint::Timer::single_shot(AWAIT_URL_TIMEOUT, move || {
+            if state.borrow().awaiting_url {
+                tracing::debug!("No URL arrived, showing the popup without one");
+                let url = state.borrow().url.clone();
+                show_popup_for_url(&state, url);
+            }
+        });
+    } else {
+        let url = state.borrow().url.clone();
+        show_popup_for_url(state, url);
+    }
 
     {
         let state = state.clone();
@@ -512,6 +657,11 @@ pub fn run(state: &SharedState) {
     #[cfg(target_os = "windows")]
     hide_main_window_from_taskbar(&win);
 
+    // on macOS the app can keep running with all windows hidden (see
+    // AppState::runs_in_background), quitting is always an explicit exit() there
+    #[cfg(target_os = "macos")]
+    slint::run_event_loop_until_quit().ok();
+    #[cfg(not(target_os = "macos"))]
     slint::run_event_loop().ok();
 }
 

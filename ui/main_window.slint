@@ -237,6 +237,8 @@ export component MainWindow inherits Window {
     callback show-about();
     callback copy-link();
     callback quit();
+    // closes the popup without opening a link - hides it when running in the background
+    callback dismiss();
     callback grab-focus();
 
     function ensure-focused-visible() {
@@ -273,7 +275,7 @@ export component MainWindow inherits Window {
         fs := FocusScope {
             key-pressed(event) => {
                 if (event.text == Key.Escape) {
-                    root.quit();
+                    root.dismiss();
                     return accept;
                 }
                 if (event.text == Key.Return || event.text == " ") {

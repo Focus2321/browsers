@@ -564,7 +564,7 @@ pub fn load_installed_browsers(
     app_finder: &OSAppFinder,
     force_reload: bool,
 ) -> (Vec<InstalledBrowser>, bool) {
-    return app_finder.get_installed_browsers_cached(force_reload);
+    app_finder.get_installed_browsers_cached(force_reload)
 }
 
 // scans in a separate thread, so a cached list can be shown right away.
@@ -692,6 +692,7 @@ pub fn unwrap_url(url_str: &str, behavioral_settings: &BehavioralConfig) -> Stri
 // (triggered by an incoming link, so the scan never runs while nobody is using the app)
 const RESCAN_INTERVAL: Duration = Duration::from_secs(60);
 
+#[allow(clippy::too_many_arguments)]
 pub fn handle_messages_to_main(
     main_receiver: Receiver<MessageToMain>,
     main_sender: Sender<MessageToMain>,
@@ -718,7 +719,7 @@ pub fn handle_messages_to_main(
 
                 let config = app_finder.load_config();
                 *visible_and_hidden_profiles =
-                    generate_all_browser_profiles(&config, &app_finder, &installed_browsers);
+                    generate_all_browser_profiles(&config, app_finder, &installed_browsers);
 
                 send_all_browsers_to_ui(visible_and_hidden_profiles, &ui_event_sink);
             }
@@ -735,7 +736,7 @@ pub fn handle_messages_to_main(
 
                 let config = app_finder.load_config();
                 *visible_and_hidden_profiles =
-                    generate_all_browser_profiles(&config, &app_finder, &installed_browsers);
+                    generate_all_browser_profiles(&config, app_finder, &installed_browsers);
 
                 send_all_browsers_to_ui(visible_and_hidden_profiles, &ui_event_sink);
             }
@@ -760,7 +761,29 @@ pub fn handle_messages_to_main(
                     rescan_installed_browsers_in_background(main_sender.clone());
                 }
 
+                if from_bundle_id == "com.apple.Safari" {
+                    // workaround for weird bug where Safari opens default browser on hard launch
+                    // see https://github.com/Browsers-software/browsers/issues/79
+                    info!("Ignoring a link from Safari, see issue #79");
+                    ui_event_sink.url_handled_without_popup();
+                    continue;
+                }
+
                 let new_modified_url = unwrap_url(url.as_str(), &behavioral_config);
+
+                // rules come first, so the popup never shows up for a link they handle
+                let url_open_context = UrlOpenContext {
+                    cleaned_url: new_modified_url.clone(),
+                    source_app_maybe: Some(from_bundle_id.clone()).filter(|id| !id.is_empty()),
+                };
+                if open_link_if_matching_rule(
+                    &url_open_context,
+                    opening_rules_and_default_profile,
+                    visible_and_hidden_profiles,
+                ) {
+                    ui_event_sink.url_handled_without_popup();
+                    continue;
+                }
 
                 let url_open_info = UrlOpenInfo {
                     url: new_modified_url,

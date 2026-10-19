@@ -88,6 +88,7 @@ pub struct EventBridgeIvars {
     resign_active: RefCell<Option<Box<dyn Fn()>>>,
     // (sender bundle id, if known; url)
     open_urls: RefCell<Option<Box<dyn Fn(Option<String>, String)>>>,
+    reopen: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 define_class!(
@@ -131,6 +132,14 @@ define_class!(
                 }
             }
         }
+
+        // the app was launched again (Finder, Dock, `open -a`) while it's already running
+        #[unsafe(method(handleReopenEvent:withReplyEvent:))]
+        fn handle_reopen_event(&self, _event: *mut AnyObject, _reply: *mut AnyObject) {
+            if let Some(cb) = self.ivars().reopen.borrow().as_ref() {
+                cb();
+            }
+        }
     }
 );
 
@@ -162,6 +171,7 @@ impl EventBridge {
         let this = Self::alloc(mtm).set_ivars(EventBridgeIvars {
             resign_active: RefCell::new(None),
             open_urls: RefCell::new(None),
+            reopen: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -174,6 +184,51 @@ impl EventBridge {
     pub fn set_open_urls_handler(&self, f: impl Fn(Option<String>, String) + 'static) {
         *self.ivars().open_urls.borrow_mut() = Some(Box::new(f));
     }
+
+    // unlike GetURL, NSApplication installs its own reopen handler while finishing launching,
+    // so this has to be called once the event loop is running, or it gets replaced
+    pub fn set_reopen_handler(&self, f: impl Fn() + 'static) {
+        *self.ivars().reopen.borrow_mut() = Some(Box::new(f));
+
+        const CLASS_CORE: u32 = 0x61657674; // 'aevt'
+        const EVENT_ID_REOPEN: u32 = 0x72617070; // 'rapp'
+        unsafe {
+            let manager: *mut AnyObject =
+                msg_send![objc2::class!(NSAppleEventManager), sharedAppleEventManager];
+            let _: () = msg_send![
+                manager,
+                setEventHandler: self,
+                andSelector: sel!(handleReopenEvent:withReplyEvent:),
+                forEventClass: CLASS_CORE,
+                andEventID: EVENT_ID_REOPEN
+            ];
+        }
+    }
+}
+
+// brings the app to the front - showing a window doesn't activate an Accessory app by itself,
+// and hide_app's hiding has to be undone first, otherwise the shown window stays invisible
+#[allow(deprecated)]
+pub fn activate_app() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        warn!("activate_app must be called from the main thread");
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    app.unhideWithoutActivation();
+    // the non-deprecated activate() only asks politely, and is often ignored when the request
+    // comes from a link click in another app
+    app.activateIgnoringOtherApps(true);
+}
+
+// hides the app while it keeps running in the background, which hands focus back to the app
+// that was active before the popup showed up
+pub fn hide_app() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        warn!("hide_app must be called from the main thread");
+        return;
+    };
+    NSApplication::sharedApplication(mtm).hide(None);
 }
 
 // hides the Dock icon via activation policy Accessory - needed alongside Info.plist's
