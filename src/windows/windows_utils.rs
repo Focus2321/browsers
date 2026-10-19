@@ -221,7 +221,7 @@ impl OsHelper {
     ) -> Vec<InstalledBrowser> {
         let mut browsers: Vec<InstalledBrowser> = Vec::new();
 
-        let cache_root_dir = get_this_app_cache_root_dir();
+        let cache_root_dir = crate::paths::get_cache_root_dir();
         let icons_root_dir = cache_root_dir.join("icons");
         fs::create_dir_all(icons_root_dir.as_path()).unwrap();
 

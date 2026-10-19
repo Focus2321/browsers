@@ -47,3 +47,11 @@ actually route clicked links to your build, then `make default-release` when don
 - `upstream` - Browsers-software/browsers
 
 Sync with upstream: `git fetch upstream && git merge upstream/main`
+
+## Isolated data folder (debug builds)
+
+Set `BROWSERS_DATA_DIR` to give a debug build its own config, cache, logs and runtime folders:
+
+    BROWSERS_DATA_DIR=/tmp/browsers-test cargo run -- https://example.com
+
+Release builds ignore it.

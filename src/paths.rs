@@ -9,7 +9,26 @@ use crate::macos::macos_utils;
 #[cfg(target_os = "windows")]
 use crate::windows::windows_utils;
 
+// Debug builds only: if BROWSERS_DATA_DIR is set, config, cache, logs and runtime files all
+// live under it instead of the user's real folders.
+// Lets several dev builds (and automated UI tests) run side by side without sharing state.
+#[cfg(debug_assertions)]
+fn data_dir_override(name: &str) -> Option<PathBuf> {
+    return std::env::var_os("BROWSERS_DATA_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| PathBuf::from(dir).join(name));
+}
+
+#[cfg(not(debug_assertions))]
+fn data_dir_override(_name: &str) -> Option<PathBuf> {
+    return None;
+}
+
 pub fn get_cache_root_dir() -> PathBuf {
+    if let Some(dir) = data_dir_override("cache") {
+        return dir;
+    }
+
     #[cfg(target_os = "macos")]
     return macos_utils::get_this_app_cache_root_dir();
 
@@ -21,6 +40,10 @@ pub fn get_cache_root_dir() -> PathBuf {
 }
 
 pub fn get_logs_root_dir() -> PathBuf {
+    if let Some(dir) = data_dir_override("logs") {
+        return dir;
+    }
+
     #[cfg(target_os = "macos")]
     return macos_utils::get_this_app_logs_root_dir();
 
@@ -40,6 +63,10 @@ pub fn get_config_json_path() -> PathBuf {
 }
 
 pub fn get_config_root_dir() -> PathBuf {
+    if let Some(dir) = data_dir_override("config") {
+        return dir;
+    }
+
     #[cfg(target_os = "macos")]
     return macos_utils::get_this_app_config_root_dir();
 
@@ -146,6 +173,10 @@ pub fn get_resources_basedir() -> PathBuf {
 }
 
 pub fn get_runtime_dir() -> PathBuf {
+    if let Some(dir) = data_dir_override("runtime") {
+        return dir;
+    }
+
     #[cfg(target_os = "macos")]
     return macos_utils::get_this_app_runtime_dir();
 
