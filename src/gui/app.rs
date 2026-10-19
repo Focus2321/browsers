@@ -14,9 +14,21 @@ use crate::gui::app_state::{
 use crate::gui::generated::{AboutWindow, MainWindow, SettingsWindow};
 use crate::gui::icon_loader::IconLoader;
 use crate::gui::{about_window, main_window, screen, settings_window, theme};
+#[cfg(target_os = "macos")]
+use crate::macos::native_popup;
 use crate::{MessageToMain, UrlOpenInfo};
 
 pub type SharedState = Rc<RefCell<AppState>>;
+
+// which link picker shows the link.
+// Native is the SwiftUI one on macOS 13+ (see macos::native_popup), the Slint MainWindow then
+// still exists for Settings/About/theme code but is never shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupBackend {
+    Slint,
+    #[cfg(target_os = "macos")]
+    Native,
+}
 
 pub struct AppState {
     pub main_sender: Sender<MessageToMain>,
@@ -31,6 +43,10 @@ pub struct AppState {
     pub restorable_app_profiles: Vec<UIBrowser>,
     pub show_set_as_default: bool,
     pub ui_settings: UISettings,
+    // the app the link came from, for the header's "from Slack" (empty if unknown)
+    pub source_app_name: String,
+    // decided again each time the popup is shown, see choose_popup_backend
+    pub popup_backend: PopupBackend,
 
     // macOS launch without a URL on the command line - the popup waits for the GetURL event
     // (see run), and this is cleared once a URL (or the timeout) shows it
@@ -54,7 +70,24 @@ impl AppState {
     }
 
     pub fn popup_visible(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if native_popup::is_visible() {
+            return true;
+        }
         self.main_window.window().is_visible()
+    }
+
+    // the native popup when it's available (see native_popup::init) and the setting is on
+    fn wanted_popup_backend(&self) -> PopupBackend {
+        #[cfg(target_os = "macos")]
+        if self.ui_settings.visual_settings.native_popup && native_popup::is_initialized() {
+            return PopupBackend::Native;
+        }
+        PopupBackend::Slint
+    }
+
+    fn native_popup_active(&self) -> bool {
+        self.popup_backend != PopupBackend::Slint
     }
 
     // no window on screen at all - the popup's hidden (or not shown yet), and Settings/About are
@@ -93,6 +126,9 @@ pub fn new(
     main_window.set_restorable_app_profiles(ModelRc::new(VecModel::default()));
     let filtered_browsers = get_filtered_browsers(&url, &browsers);
 
+    #[cfg(target_os = "macos")]
+    native_popup::init(on_native_popup_event);
+
     let state = Rc::new(RefCell::new(AppState {
         main_sender,
         main_window,
@@ -105,8 +141,15 @@ pub fn new(
         restorable_app_profiles,
         show_set_as_default,
         ui_settings,
+        source_app_name: String::new(),
+        popup_backend: PopupBackend::Slint,
         awaiting_url: false,
     }));
+    // the native popup's events find the state through this
+    APP_STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
+    let popup_backend = state.borrow().wanted_popup_backend();
+    state.borrow_mut().popup_backend = popup_backend;
+    tracing::info!("Popup: {popup_backend:?}");
 
     apply_theme(&state);
     refresh_main_window_model(&state);
@@ -117,19 +160,34 @@ pub fn new(
 }
 
 pub fn apply_theme(state: &SharedState) {
-    let st = state.borrow();
-    let system_is_dark = theme::detect_system_is_dark(&st.main_window);
-    let palette = theme::resolve_palette(&st.ui_settings.visual_settings, system_is_dark);
-    theme::apply_to_window(&palette, &st.main_window);
-    if let Some(w) = &st.settings_window {
-        theme::apply_to_window(&palette, w);
+    {
+        let st = state.borrow();
+        let system_is_dark = theme::detect_system_is_dark(&st.main_window);
+        let palette = theme::resolve_palette(&st.ui_settings.visual_settings, system_is_dark);
+        theme::apply_to_window(&palette, &st.main_window);
+        if let Some(w) = &st.settings_window {
+            theme::apply_to_window(&palette, w);
+        }
+        if let Some(w) = &st.about_window {
+            theme::apply_to_window(&palette, w);
+        }
     }
-    if let Some(w) = &st.about_window {
-        theme::apply_to_window(&palette, w);
+    // it gets the theme as its "appearance"
+    #[cfg(target_os = "macos")]
+    if state.borrow().native_popup_active() {
+        update_native_popup(state);
     }
 }
 
+// puts the current links/browsers/settings into whichever popup is in use
 pub fn refresh_main_window_model(state: &SharedState) {
+    // the native popup draws (and filters) its rows from the same state
+    #[cfg(target_os = "macos")]
+    if state.borrow().native_popup_active() {
+        update_native_popup(state);
+        return;
+    }
+
     let mut st = state.borrow_mut();
     let show_hotkeys = st.ui_settings.visual_settings.show_hotkeys;
     let filter_text = st.main_window.get_filter_text();
@@ -154,6 +212,7 @@ pub fn refresh_main_window_model(state: &SharedState) {
     let win = st.main_window.clone_strong();
     let show_set_as_default = st.show_set_as_default;
     let url = st.url.clone();
+    let source_app_name = st.source_app_name.clone();
     drop(st);
 
     let browser_count = items.len() as i32;
@@ -163,6 +222,7 @@ pub fn refresh_main_window_model(state: &SharedState) {
     let (url_domain, url_path) = main_window::split_url_for_header(&url);
     win.set_url_domain(url_domain.into());
     win.set_url_path(url_path.into());
+    win.set_source_app_name(source_app_name.into());
     win.set_icon_size(main_window::get_icon_size());
 
     // keep the focus index in range as the (filtered) list changes size - after a hide/restore/move,
@@ -178,9 +238,7 @@ pub fn forward_handler(
     to_message: impl Fn() -> MessageToMain + 'static,
 ) -> impl Fn() + 'static {
     let state = state.clone();
-    move || {
-        let _ = state.borrow().main_sender.send(to_message());
-    }
+    move || send_to_main(&state, to_message())
 }
 
 // builds a one-arg (string id) callback handler that just forwards the id into a message at main -
@@ -191,9 +249,11 @@ pub fn forward_id_handler(
     to_message: impl Fn(String) -> MessageToMain + 'static,
 ) -> impl Fn(slint::SharedString) + 'static {
     let state = state.clone();
-    move |id| {
-        let _ = state.borrow().main_sender.send(to_message(id.to_string()));
-    }
+    move |id| send_to_main(&state, to_message(id.to_string()))
+}
+
+fn send_to_main(state: &SharedState, message: MessageToMain) {
+    let _ = state.borrow().main_sender.send(message);
 }
 
 // focuses (and shows) an already-open singleton window instead of creating a second instance;
@@ -254,14 +314,11 @@ pub fn show_popup_for_url(state: &SharedState, url: String) {
         st.url = url;
         st.filtered_browsers = get_filtered_browsers(&st.url, &st.browsers);
     }
-    refresh_main_window_model(state);
-    let win = state.borrow().main_window.clone_strong();
-    reset_popup_state(&win);
-    reposition_main_window(state);
-    win.window().show().ok();
-    #[cfg(target_os = "macos")]
-    crate::macos::macos_native::activate_app();
-    win.invoke_grab_focus();
+    match choose_popup_backend(state) {
+        PopupBackend::Slint => show_slint_popup(state),
+        #[cfg(target_os = "macos")]
+        PopupBackend::Native => show_native_popup(state),
+    }
 
     match LAUNCHED_AT.with(|launched_at| launched_at.take()) {
         Some(launched_at) => tracing::debug!(
@@ -272,25 +329,66 @@ pub fn show_popup_for_url(state: &SharedState, url: String) {
     }
 }
 
+// decided for every appearance, so turning the "Native popup" setting on or off applies from the
+// next link on
+fn choose_popup_backend(state: &SharedState) -> PopupBackend {
+    let mut st = state.borrow_mut();
+    let backend = st.wanted_popup_backend();
+    if backend != st.popup_backend {
+        tracing::info!("Popup: {backend:?}");
+        st.popup_backend = backend;
+    }
+    backend
+}
+
+fn show_slint_popup(state: &SharedState) {
+    refresh_main_window_model(state);
+    let win = state.borrow().main_window.clone_strong();
+    reset_popup_state(&win);
+    reposition_main_window(state);
+    win.window().show().ok();
+    #[cfg(target_os = "macos")]
+    crate::macos::macos_native::activate_app();
+    win.invoke_grab_focus();
+}
+
+// Swift positions it at the cursor and resets its filter/selection itself
+#[cfg(target_os = "macos")]
+fn show_native_popup(state: &SharedState) {
+    // built first, so nothing is borrowed while Swift runs (it may call right back)
+    let json = native_popup::PopupState::from_app_state(&state.borrow()).to_json();
+    crate::macos::macos_native::activate_app();
+    native_popup::show(&json);
+}
+
+// new content for the native popup, without moving it or resetting its filter/selection
+#[cfg(target_os = "macos")]
+fn update_native_popup(state: &SharedState) {
+    let json = native_popup::PopupState::from_app_state(&state.borrow()).to_json();
+    native_popup::update(&json);
+}
+
 // the app was launched again while running - shows the popup like a launch without a URL would,
 // unless it's already showing a URL
 pub fn reopen(state: &SharedState) {
-    let win = state.borrow().main_window.clone_strong();
-    if win.window().is_visible() {
-        #[cfg(target_os = "macos")]
-        crate::macos::macos_native::activate_app();
-        win.invoke_grab_focus();
+    if state.borrow().popup_visible() {
+        refocus_popup(state);
         return;
     }
-    win.set_source_app_name("".into());
+    state.borrow_mut().source_app_name.clear();
     show_popup_for_url(state, String::new());
 }
 
 // hides the popup without quitting (see AppState::runs_in_background), giving focus back to the
 // previous app unless Settings/About are still open
 pub fn hide_popup(state: &SharedState) {
+    // both, in case the "Native popup" setting changed while one of them was showing
     let win = state.borrow().main_window.clone_strong();
-    win.window().hide().ok();
+    if win.window().is_visible() {
+        win.window().hide().ok();
+    }
+    #[cfg(target_os = "macos")]
+    native_popup::hide();
     tracing::debug!("Popup hidden");
     #[cfg(target_os = "macos")]
     if state.borrow().nothing_visible() {
@@ -335,6 +433,12 @@ pub fn on_app_lost_focus(state: &SharedState) {
 // makes the popup the key window again, so Escape and the arrow keys reach it - closing
 // Settings/About doesn't hand the keyboard back to it on its own
 fn refocus_popup(state: &SharedState) {
+    #[cfg(target_os = "macos")]
+    if native_popup::is_visible() {
+        crate::macos::macos_native::activate_app();
+        native_popup::focus();
+        return;
+    }
     let win = state.borrow().main_window.clone_strong();
     if !win.window().is_visible() {
         return;
@@ -372,6 +476,10 @@ fn apply_main_window_size(win: &MainWindow) -> (f32, f32) {
 // launch, or a new URL opened while already running), not a same-URL refresh of an already-visible
 // window
 pub fn reposition_main_window(state: &SharedState) {
+    // the native popup places and sizes itself
+    if state.borrow().native_popup_active() {
+        return;
+    }
     let win = state.borrow().main_window.clone_strong();
 
     let (mouse, work_area) = screen::mouse_position_and_work_area();
@@ -389,6 +497,9 @@ pub fn reposition_main_window(state: &SharedState) {
 // resizes for the current browser count without moving it - for refreshing an already-visible
 // window's content (Refresh, restoring a hidden profile)
 pub fn resize_main_window(state: &SharedState) {
+    if state.borrow().native_popup_active() {
+        return;
+    }
     let win = state.borrow().main_window.clone_strong();
     apply_main_window_size(&win);
 }
@@ -415,12 +526,7 @@ fn wire_main_window(state: &SharedState) {
     }
     {
         let state = state.clone();
-        win.on_copy_link(move || {
-            let url = state.borrow().url.clone();
-            if let Ok(mut ctx) = ClipboardContext::new() {
-                let _ = ctx.set_contents(url);
-            }
-        });
+        win.on_copy_link(move || copy_link(&state));
     }
     {
         let state = state.clone();
@@ -466,6 +572,53 @@ fn wire_main_window(state: &SharedState) {
     win.on_quit(move || {
         exit(crate::QUIT_EXIT_CODE);
     });
+}
+
+// the native popup's events, mapped to the same actions as the Slint popup's callbacks in
+// wire_main_window.
+// Swift calls this on the main thread, from inside the AppKit event loop winit runs.
+#[cfg(target_os = "macos")]
+fn on_native_popup_event(event: native_popup::PopupEvent) {
+    use native_popup::PopupEvent;
+
+    // cloned out, so APP_STATE itself isn't borrowed while the event is handled
+    let Some(state) = APP_STATE.with(|s| s.borrow().clone()) else {
+        return;
+    };
+    match event {
+        PopupEvent::Open {
+            profile_index,
+            private,
+        } => open_browser(&state, profile_index, private),
+        PopupEvent::CopyLink => copy_link(&state),
+        PopupEvent::AlwaysOpenHere {
+            unique_id,
+            profile_index,
+        } => always_open_here(&state, unique_id, profile_index),
+        PopupEvent::HideProfile { unique_id } => {
+            send_to_main(&state, MessageToMain::HideAppProfile(unique_id))
+        }
+        PopupEvent::HideApp { unique_app_id } => {
+            send_to_main(&state, MessageToMain::HideAllProfiles(unique_app_id))
+        }
+        PopupEvent::RestoreProfile { unique_id } => {
+            send_to_main(&state, MessageToMain::RestoreAppProfile(unique_id))
+        }
+        PopupEvent::Refresh => send_to_main(&state, MessageToMain::Refresh),
+        PopupEvent::SetDefault => send_to_main(&state, MessageToMain::SetBrowsersAsDefaultBrowser),
+        PopupEvent::Settings => settings_window::open(&state),
+        PopupEvent::About => about_window::open(&state),
+        // always quits, also while running in the background
+        PopupEvent::Quit => exit(crate::QUIT_EXIT_CODE),
+        PopupEvent::Dismiss => dismiss_popup(&state),
+    }
+}
+
+fn copy_link(state: &SharedState) {
+    let url = state.borrow().url.clone();
+    if let Ok(mut ctx) = ClipboardContext::new() {
+        let _ = ctx.set_contents(url);
+    }
 }
 
 // opens the browser at the given position in the list as shown in the window (after the url and
@@ -539,8 +692,10 @@ fn always_open_here(state: &SharedState, profile_id: String, browser_profile_ind
 }
 
 thread_local! {
-    // lets UiHandle stay Send without unsafe impl - SharedState itself never crosses threads,
-    // only this thread-local handle to it does
+    // set in new().
+    // Lets UiHandle stay Send without unsafe impl - SharedState itself never crosses threads,
+    // only this thread-local handle to it does.
+    // The native popup's events (see on_native_popup_event) also come in through it.
     static APP_STATE: RefCell<Option<SharedState>> = const { RefCell::new(None) };
 }
 
@@ -552,7 +707,6 @@ pub struct UiHandle {
 
 impl UiHandle {
     pub fn new(state: &SharedState) -> Self {
-        APP_STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
         UiHandle {
             main_weak: state.borrow().main_window.as_weak(),
         }
@@ -592,11 +746,8 @@ impl UiHandle {
 
     pub fn cleaned_url_opened(&self, info: UrlOpenInfo) {
         self.with_state(move |state| {
-            {
-                let st = state.borrow();
-                let source_app_name = main_window::source_app_name(&info.source_bundle_id);
-                st.main_window.set_source_app_name(source_app_name.into());
-            }
+            let source_app_name = main_window::source_app_name(&info.source_bundle_id);
+            state.borrow_mut().source_app_name = source_app_name;
             show_popup_for_url(state, info.url);
         });
     }

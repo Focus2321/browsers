@@ -91,6 +91,9 @@ pub struct UIConfig {
 
     // the "N of these aren't web browsers" banner in Settings was hidden for good
     pub non_browser_banner_dismissed: bool,
+
+    // macOS 13+ only: show the SwiftUI link picker instead of the Slint one
+    pub native_popup: bool,
 }
 
 impl Default for UIConfig {
@@ -100,6 +103,7 @@ impl Default for UIConfig {
             quit_on_lost_focus: false,
             theme: ConfiguredTheme::Auto,
             non_browser_banner_dismissed: false,
+            native_popup: true,
         }
     }
 }

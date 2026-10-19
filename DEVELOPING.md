@@ -41,6 +41,18 @@ Experimenting in the dev build never touches the settings of the copy you use ev
 Most changes only need `make run`. Use `make dev` + `make default-dev` when you need macOS to
 actually route clicked links to your build, then `make default-release` when done.
 
+## Native popup (macOS)
+
+The link picker on macOS 13+ is SwiftUI, in `native/macos/BrowsersPopup/` (see `CONTRACT.md` there
+for how it talks to the Rust side in `src/macos/native_popup.rs`).
+`build.rs` compiles every `.swift` file in that folder with `swiftc` from the Command Line Tools,
+so there's still no Xcode project.
+
+The Slint popup (`ui/main_window.slint`) is still used on older macOS, with the "Native popup"
+setting off, with `SLINT_BACKEND=headless` (the MCP test mode in CLAUDE.md), or when forced:
+
+    BROWSERS_POPUP=slint cargo run -- https://example.com
+
 ## Remotes
 
 - `origin` - your fork (Focus2321/browsers)

@@ -839,11 +839,14 @@ export component SettingsWindow inherits Window {
     in property <bool> show-quit-on-lost-focus;
     in property <bool> unwrap-urls;
     in property <bool> run-in-background;
+    in property <bool> native-popup;
+    in property <bool> show-native-popup;
     callback theme-changed(ThemeChoice);
     callback show-hotkeys-changed(bool);
     callback quit-on-lost-focus-changed(bool);
     callback unwrap-urls-changed(bool);
     callback run-in-background-changed(bool);
+    callback native-popup-changed(bool);
 
     // ---- About page
     in property <image> app-icon;
@@ -1850,6 +1853,13 @@ export component SettingsWindow inherits Window {
                         CardBox {
                             height: popup-rows.preferred-height;
                             popup-rows := VerticalLayout {
+                                // macOS 13+ only
+                                if root.show-native-popup: SettingRow {
+                                    title: "Native popup";
+                                    helper: "Use the macOS look for the link picker.";
+                                    checked: root.native-popup;
+                                    toggled(v) => { root.native-popup-changed(v); }
+                                }
                                 SettingRow {
                                     title: "Show hotkey numbers";
                                     helper: "Press 1–9 in the popup to open the matching app.";

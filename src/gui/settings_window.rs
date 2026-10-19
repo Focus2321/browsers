@@ -198,6 +198,8 @@ pub fn open(state: &SharedState) {
     );
     win.set_version_text(format!("Version {}", VERSION).into());
     win.set_show_quit_on_lost_focus(cfg!(target_os = "macos"));
+    #[cfg(target_os = "macos")]
+    win.set_show_native_popup(crate::macos::native_popup::is_supported());
     win.set_is_default_browser(utils::is_default_web_browser());
     win.set_debug_hold_drag(
         cfg!(debug_assertions) && std::env::var_os("BROWSERS_DEBUG_HOLD_DRAG").is_some(),
@@ -1052,6 +1054,7 @@ fn refresh_general(state: &SharedState, win: &SettingsWindow) {
     win.set_quit_on_lost_focus(settings.visual_settings.quit_on_lost_focus);
     win.set_unwrap_urls(settings.behavioral_settings.unwrap_urls);
     win.set_run_in_background(settings.behavioral_settings.run_in_background);
+    win.set_native_popup(settings.visual_settings.native_popup);
     win.set_theme(theme_to_choice(settings.visual_settings.theme));
     win.global::<StdWidgetPalette>()
         .set_color_scheme(theme_to_color_scheme(settings.visual_settings.theme));
@@ -1420,6 +1423,18 @@ fn wire(state: &SharedState, win: &SettingsWindow) {
                 .run_in_background = v;
             send(&state, MessageToMain::SetRunInBackground(v));
             refresh(&state);
+        });
+    }
+    {
+        let state = state.clone();
+        win.on_native_popup_changed(move |v| {
+            state.borrow_mut().ui_settings.visual_settings.native_popup = v;
+            // the next link shows the other popup (see app::show_popup_for_url), and the one up
+            // now goes away rather than lingering next to it
+            if state.borrow().popup_visible() {
+                app::hide_popup(&state);
+            }
+            save_visual_settings(&state);
         });
     }
 }

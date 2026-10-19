@@ -13,6 +13,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Redesigned Settings with Browsers, Rules, General and About pages: drag to reorder, show/hide in place, profiles grouped by browser, and an offer to hide apps that aren't browsers
 - Rules page: "Test a link", drag to reorder rules, new rules stay drafts until complete, hidden profiles can be rule targets
 - macOS: "Keep running in the background" (on by default) shows the picker instantly for every link after the first
+- macOS 13+: a native (SwiftUI) link picker, on by default, switchable with Settings → General → "Native popup"
 
 ### Fixed
 
