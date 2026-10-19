@@ -1856,7 +1856,8 @@ export component SettingsWindow inherits Window {
                                     checked: root.show-hotkeys;
                                     toggled(v) => { root.show-hotkeys-changed(v); }
                                 }
-                                if root.show-quit-on-lost-focus: SettingRow {
+                                // while running in the background the popup always hides when you click elsewhere
+                                if root.show-quit-on-lost-focus && !root.run-in-background: SettingRow {
                                     title: "Close when clicking elsewhere";
                                     helper: "The popup goes away as soon as another window takes focus.";
                                     checked: root.quit-on-lost-focus;

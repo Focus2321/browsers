@@ -308,10 +308,10 @@ fn entry_row(
     }
 }
 
-// splits the full order into runs of consecutive profiles of the same app.
-// An app's profiles only form a group while they sit next to each other, so a group never hides
-// where something else was placed in between.
+// splits the full order into one group per app: an app's profiles are pulled together at the
+// spot of its first one (see profile_order::group_by_app), even if the saved order split them up.
 fn group_entries<'a>(entries: Vec<Entry<'a>>) -> Vec<Vec<Entry<'a>>> {
+    let entries = profile_order::group_by_app(entries, |e| e.browser.unique_app_id.to_string());
     let mut groups: Vec<Vec<Entry>> = vec![];
     for entry in entries {
         match groups.last_mut() {

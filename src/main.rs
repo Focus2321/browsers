@@ -156,14 +156,7 @@ fn main() {
     if let Some(bridge) = &bridge {
         let resign_active_state = state.clone();
         bridge.set_resign_active_handler(move || {
-            let (applies, popup_visible) = {
-                let st = resign_active_state.borrow();
-                (st.quit_on_lost_focus_applies(), st.popup_visible())
-            };
-            // hiding the app ourselves (see app::hide_popup) resigns active too
-            if applies && popup_visible {
-                app::dismiss_popup(&resign_active_state);
-            }
+            app::on_app_lost_focus(&resign_active_state);
         });
 
         let open_urls_sender = main_sender.clone();

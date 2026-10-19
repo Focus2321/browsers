@@ -78,6 +78,12 @@ pub fn get_config_root_dir() -> PathBuf {
 }
 
 pub fn get_chrome_user_dir_root() -> PathBuf {
+    // debug builds: a BROWSERS_DATA_DIR/app-support folder stands in for Application Support, so
+    // UI tests can use made-up Chromium profiles (e.g. app-support/Google/Chrome/Local State)
+    if let Some(dir) = data_dir_override("app-support").filter(|dir| dir.exists()) {
+        return dir;
+    }
+
     #[cfg(target_os = "macos")]
     return macos_utils::macos_get_unsandboxed_application_support_dir();
 
