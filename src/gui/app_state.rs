@@ -103,14 +103,15 @@ impl UISettingsRule {
         }
     }
 
-    // a rule is worth saving once it says what to match (a valid url pattern, or just a source
-    // app) and where to open it.
-    // Anything less stays a draft in Settings.
-    pub fn is_complete(&self) -> bool {
+    // whether the rule says what to match: a valid url pattern, or no pattern but a source app.
+    // A rule without an opener still counts, since matching it shows the picker.
+    pub fn has_valid_matcher(&self) -> bool {
         let pattern = self.url_pattern.trim();
-        let has_valid_pattern = !pattern.is_empty() && crate::url_rule::is_valid_pattern(pattern);
-        let pattern_ok = has_valid_pattern || (pattern.is_empty() && !self.source_app.is_empty());
-        pattern_ok && self.opener.is_some()
+        if pattern.is_empty() {
+            !self.source_app.is_empty()
+        } else {
+            crate::url_rule::is_valid_pattern(pattern)
+        }
     }
 }
 
@@ -247,30 +248,27 @@ mod tests {
     }
 
     #[test]
-    fn rule_with_pattern_and_target_is_complete() {
-        assert!(rule("", "github.com/acme/**", Some("chrome#work")).is_complete());
+    fn rule_with_valid_pattern_has_a_matcher() {
+        assert!(rule("", "github.com/acme/**", Some("chrome#work")).has_valid_matcher());
+        // no opener means "show the picker", which is still a rule
+        assert!(rule("", "github.com", None).has_valid_matcher());
     }
 
     #[test]
-    fn rule_with_only_source_app_and_target_is_complete() {
-        assert!(rule("com.tinyspeck.slackmacgap", "", Some("chrome#work")).is_complete());
+    fn rule_with_only_source_app_has_a_matcher() {
+        assert!(rule("com.tinyspeck.slackmacgap", "", Some("chrome#work")).has_valid_matcher());
     }
 
     #[test]
-    fn rule_without_target_is_a_draft() {
-        assert!(!rule("", "github.com", None).is_complete());
+    fn rule_without_pattern_or_source_app_has_no_matcher() {
+        assert!(!rule("", "", Some("chrome#work")).has_valid_matcher());
+        assert!(!rule("", "   ", Some("chrome#work")).has_valid_matcher());
     }
 
     #[test]
-    fn rule_without_pattern_or_source_app_is_a_draft() {
-        assert!(!rule("", "", Some("chrome#work")).is_complete());
-        assert!(!rule("", "   ", Some("chrome#work")).is_complete());
-    }
-
-    #[test]
-    fn rule_with_invalid_pattern_is_a_draft() {
-        assert!(!rule("", "github.com/[", Some("chrome#work")).is_complete());
+    fn rule_with_invalid_pattern_has_no_matcher() {
+        assert!(!rule("", "github.com/[", Some("chrome#work")).has_valid_matcher());
         // a broken pattern isn't rescued by also having a source app
-        assert!(!rule("com.apple.mail", "github.com/[", Some("chrome#work")).is_complete());
+        assert!(!rule("com.apple.mail", "github.com/[", Some("chrome#work")).has_valid_matcher());
     }
 }

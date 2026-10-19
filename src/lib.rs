@@ -533,7 +533,8 @@ pub enum RuleTestOutcome {
 
 // runs `url` (a missing scheme means https) coming from `source_app` through `rules` exactly like
 // an opened link would be, see get_rule_for_source_app_and_url.
-// Incomplete rules (drafts) are skipped, but the returned index still points into `rules`.
+// Rules with nothing valid to match are skipped, but the returned index still points into
+// `rules`.
 pub fn test_opening_rules(
     rules: &[UISettingsRule],
     has_default_profile: bool,
@@ -556,7 +557,7 @@ pub fn test_opening_rules(
     let complete_rules: Vec<(usize, OpeningRule)> = rules
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.is_complete())
+        .filter(|(_, r)| r.has_valid_matcher())
         .map(|(i, r)| (i, ui_rule_to_opening_rule(r)))
         .collect();
     let opening_rules: Vec<OpeningRule> = complete_rules.iter().map(|(_, r)| r.clone()).collect();
@@ -1284,14 +1285,21 @@ mod tests {
     }
 
     #[test]
-    fn test_opening_rules_skips_drafts_but_keeps_their_index() {
+    fn test_opening_rules_skips_rules_without_a_matcher_but_keeps_their_index() {
         let rules = vec![
-            rule("", "github.com", None),
+            rule("", "", Some("nothing")),
             rule("", "github.com/[", Some("broken")),
             rule("", "github.com", Some("personal")),
         ];
         let outcome = test_opening_rules(&rules, false, "github.com", None);
         assert_eq!(outcome, RuleTestOutcome::MatchedRule(2));
+    }
+
+    #[test]
+    fn test_opening_rules_matches_a_rule_that_shows_the_picker() {
+        let rules = vec![rule("", "github.com", None)];
+        let outcome = test_opening_rules(&rules, true, "github.com", None);
+        assert_eq!(outcome, RuleTestOutcome::MatchedRule(0));
     }
 
     #[test]
